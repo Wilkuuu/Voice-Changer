@@ -18,6 +18,8 @@ import numpy as np
 import soundfile as sf
 import torch
 
+import translate as tr
+
 SAMPLE_RATE = 16000
 CHUNK_SECONDS = 15  # WavLM attention is O(N²); 15s chunks keep it manageable on CPU
 _model = None
@@ -66,6 +68,48 @@ def extract_features_chunked(knn_vc, wav: torch.Tensor, progress: gr.Progress, b
     return torch.cat(chunks, dim=0)
 
 
+def run_translate_convert(input_audio, reference_audio, target_language, topk, progress=gr.Progress()):
+    """Translate speech and optionally apply voice conversion."""
+    if input_audio is None:
+        raise gr.Error("Please upload an input audio file.")
+
+    knn_vc = get_model()
+    device = next(knn_vc.parameters()).device
+
+    matching_set = None
+    if reference_audio is not None:
+        progress(0.05, desc="Building reference voice matching set...")
+        ref_wav = load_audio_array(reference_audio).to(device)
+        with torch.inference_mode():
+            matching_set = knn_vc.get_matching_set([ref_wav])
+
+    status_lines: list[str] = []
+
+    def log(msg: str):
+        status_lines.append(msg)
+        progress(min(0.1 + len(status_lines) * 0.15, 0.9), desc=msg)
+
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+        out_path = tmp.name
+
+    english_text, translated_text = tr.run_pipeline(
+        audio_path=input_audio,
+        target_language=target_language,
+        output_path=out_path,
+        knn_vc=knn_vc if matching_set is not None else None,
+        matching_set=matching_set,
+        topk=int(topk),
+        progress_cb=log,
+    )
+
+    out_wav, _ = librosa.load(out_path, sr=SAMPLE_RATE, mono=True)
+    Path(out_path).unlink(missing_ok=True)
+
+    progress(1.0, desc="Done.")
+    transcript = f"[English]\n{english_text}\n\n[{target_language}]\n{translated_text}"
+    return (SAMPLE_RATE, out_wav), transcript
+
+
 def run_conversion(input_audio, reference_audio, topk: int, progress=gr.Progress()):
     """Gradio handler: takes file paths, returns (sample_rate, numpy_array)."""
     if input_audio is None:
@@ -97,59 +141,87 @@ def run_conversion(input_audio, reference_audio, topk: int, progress=gr.Progress
 
 
 def build_ui():
-    with gr.Blocks(title="Zero-Shot Voice Conversion") as demo:
-        gr.Markdown(
-            """
-            # Zero-Shot Voice Conversion
-            Convert any voice to match a reference speaker — no training required.
+    with gr.Blocks(title="Voice Changer") as demo:
+        gr.Markdown("# Voice Changer — Zero-Shot")
 
-            **How it works:** Upload the audio you want to convert and a short sample
-            of the target voice (5-30 seconds). The model uses k-nearest neighbor
-            matching on HuBERT/WavLM features to transfer the voice style.
-            """
-        )
+        with gr.Tabs():
+            # ── Tab 1: Voice Conversion ──────────────────────────────────────
+            with gr.Tab("Voice Conversion"):
+                gr.Markdown(
+                    "Convert voice in input audio to match a reference speaker. "
+                    "No training required."
+                )
+                with gr.Row():
+                    with gr.Column():
+                        vc_input = gr.Audio(label="Input Audio", type="filepath")
+                        vc_ref = gr.Audio(
+                            label="Reference Voice Sample (5-30s)", type="filepath"
+                        )
+                        vc_topk = gr.Slider(
+                            minimum=1, maximum=16, value=4, step=1,
+                            label="Top-K Neighbors",
+                            info="Higher = smoother, lower = more expressive",
+                        )
+                        vc_btn = gr.Button("Convert Voice", variant="primary")
+                    with gr.Column():
+                        vc_output = gr.Audio(label="Converted Audio", type="numpy")
 
-        with gr.Row():
-            with gr.Column():
-                input_audio = gr.Audio(
-                    label="Input Audio (voice to convert)",
-                    type="filepath",
-                )
-                reference_audio = gr.Audio(
-                    label="Reference Voice Sample (target speaker, 5-30s)",
-                    type="filepath",
-                )
-                topk = gr.Slider(
-                    minimum=1,
-                    maximum=16,
-                    value=4,
-                    step=1,
-                    label="Top-K Neighbors",
-                    info="Higher = smoother output, lower = more expressive",
-                )
-                convert_btn = gr.Button("Convert Voice", variant="primary")
-
-            with gr.Column():
-                output_audio = gr.Audio(
-                    label="Converted Audio",
-                    type="numpy",
+                vc_btn.click(
+                    fn=run_conversion,
+                    inputs=[vc_input, vc_ref, vc_topk],
+                    outputs=[vc_output],
                 )
 
-        convert_btn.click(
-            fn=run_conversion,
-            inputs=[input_audio, reference_audio, topk],
-            outputs=[output_audio],
-        )
+                gr.Markdown(
+                    "**Tips:** Reference should be clean speech, 15-30s. "
+                    "Supports WAV, MP3, FLAC, OGG."
+                )
 
-        gr.Markdown(
-            """
-            **Tips:**
-            - Reference sample should be clean speech (no background music/noise)
-            - Longer reference audio (15-30s) generally gives better results
-            - Input and reference should be WAV, MP3, FLAC, or OGG
-            - First run downloads ~1.5 GB of model weights (cached for future runs)
-            """
-        )
+            # ── Tab 2: Translate & Convert ───────────────────────────────────
+            with gr.Tab("Translate & Convert"):
+                gr.Markdown(
+                    "Translate speech from **any language** to a target language, "
+                    "then optionally apply voice conversion to match a reference speaker.\n\n"
+                    "Pipeline: **Whisper ASR** → **MarianMT translation** → "
+                    "**edge-tts** → *(optional)* **kNN-VC voice conversion**"
+                )
+                with gr.Row():
+                    with gr.Column():
+                        tr_input = gr.Audio(label="Input Audio (any language)", type="filepath")
+                        tr_ref = gr.Audio(
+                            label="Reference Voice Sample (optional, for voice conversion)",
+                            type="filepath",
+                        )
+                        tr_lang = gr.Dropdown(
+                            choices=list(tr.LANGUAGES.keys()),
+                            value="Polish",
+                            label="Target Language",
+                        )
+                        tr_topk = gr.Slider(
+                            minimum=1, maximum=16, value=4, step=1,
+                            label="Top-K Neighbors (used only with reference voice)",
+                            info="Higher = smoother, lower = more expressive",
+                        )
+                        tr_btn = gr.Button("Translate & Convert", variant="primary")
+                    with gr.Column():
+                        tr_output = gr.Audio(label="Output Audio", type="numpy")
+                        tr_transcript = gr.Textbox(
+                            label="Transcription & Translation",
+                            lines=6,
+                            interactive=False,
+                        )
+
+                tr_btn.click(
+                    fn=run_translate_convert,
+                    inputs=[tr_input, tr_ref, tr_lang, tr_topk],
+                    outputs=[tr_output, tr_transcript],
+                )
+
+                gr.Markdown(
+                    "**Tips:** "
+                    "Reference voice is optional — without it you get translated TTS only. "
+                    "First use downloads Whisper (~150 MB) and MarianMT (~300 MB per language pair)."
+                )
 
     return demo
 

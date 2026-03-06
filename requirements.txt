@@ -5,3 +5,10 @@ soundfile
 librosa
 gradio>=4.0.0
 huggingface_hub
+
+# Translation pipeline
+faster-whisper
+transformers>=4.30.0
+sentencepiece
+sacremoses
+edge-tts
