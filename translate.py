@@ -7,9 +7,10 @@ Free tools (all local except edge-tts):
 - argostranslate : English → target language (local, own package system)
 - edge-tts       : Neural TTS (free, Microsoft Edge voices, online)
 
-Sync mode: each Whisper segment is translated, synthesized with TTS, then
-time-stretched to match the original segment's duration — output stays in
-sync with the source audio timeline.
+Sync mode (DTW): for each Whisper segment, TTS audio is non-uniformly warped to
+match the energy-peak positions of the source — not just its total length.
+DTW (Dynamic Time Warping) aligns RMS energy envelopes so that speech peaks in the
+translated audio land at the same moments as speech peaks in the original.
 """
 
 import asyncio
@@ -28,6 +29,7 @@ import argostranslate.package
 import argostranslate.translate
 
 SAMPLE_RATE = 16000
+DTW_HOP = 160  # 10 ms frames at 16 kHz for energy envelope
 
 # Target languages: ISO 639-1 code + edge-tts neural voice
 LANGUAGES: dict[str, dict] = {
@@ -57,7 +59,6 @@ def get_whisper(model_size: str = "base") -> WhisperModel:
 
 
 def ensure_translation_package(from_code: str, to_code: str) -> None:
-    """Download and install argostranslate language pair if not already present."""
     pair = (from_code, to_code)
     if pair in _installed_pairs:
         return
@@ -90,11 +91,8 @@ def translate_en_to_target(text: str, target_language: str) -> str:
 
 
 def _tts_run(text: str, voice: str, path: str) -> None:
-    """
-    Run edge-tts in a dedicated thread with its own event loop.
-    This avoids conflicts with any existing event loop (e.g. Gradio's).
-    """
-    result: list[Exception] = []
+    """Run edge-tts in a dedicated thread with its own event loop (no Gradio conflict)."""
+    exc: list[Exception] = []
 
     def _worker():
         loop = asyncio.new_event_loop()
@@ -102,39 +100,95 @@ def _tts_run(text: str, voice: str, path: str) -> None:
         try:
             loop.run_until_complete(edge_tts.Communicate(text, voice).save(path))
         except Exception as e:
-            result.append(e)
+            exc.append(e)
         finally:
             loop.close()
 
     t = threading.Thread(target=_worker, daemon=True)
     t.start()
     t.join()
-    if result:
-        raise result[0]
+    if exc:
+        raise exc[0]
 
 
 def tts_to_file(text: str, target_language: str, output_path: str) -> None:
     _tts_run(text, LANGUAGES[target_language]["tts_voice"], output_path)
 
 
-def _time_stretch_to_duration(audio: np.ndarray, target_seconds: float) -> np.ndarray:
-    """
-    Time-stretch audio to exactly target_seconds without changing pitch.
-    Stretch ratio is clamped to [0.4, 3.0] to preserve intelligibility.
-    """
-    if len(audio) == 0 or target_seconds <= 0:
-        return audio
-    target_samples = int(target_seconds * SAMPLE_RATE)
-    rate = len(audio) / target_samples
-    rate = float(np.clip(rate, 0.4, 3.0))
-    stretched = librosa.effects.time_stretch(audio, rate=rate)
-    # Hard-trim or zero-pad to exact target length
-    if len(stretched) > target_samples:
-        return stretched[:target_samples]
-    return np.pad(stretched, (0, target_samples - len(stretched)))
+# ── DTW peak alignment ────────────────────────────────────────────────────────
 
+def _rms_envelope(audio: np.ndarray) -> np.ndarray:
+    """Normalised RMS energy envelope at DTW_HOP resolution."""
+    env = librosa.feature.rms(y=audio, frame_length=512, hop_length=DTW_HOP)[0].astype(np.float32)
+    peak = env.max()
+    return env / (peak + 1e-8)
+
+
+def _dtw_warp_to_source(src: np.ndarray, tts: np.ndarray) -> np.ndarray:
+    """
+    Non-uniformly warp `tts` to match `src` duration by aligning their RMS
+    energy envelopes via DTW.  Output length equals len(src).
+
+    This preserves natural TTS speed locally — peaks are aligned without
+    the artefacts of global uniform time-stretching.
+    """
+    n_src = len(src)
+    n_tts = len(tts)
+
+    if n_tts == 0:
+        return np.zeros(n_src, dtype=np.float32)
+    if n_src == 0:
+        return np.zeros(0, dtype=np.float32)
+
+    # Short segments: simple linear resampling is fine
+    min_samples = 4 * DTW_HOP
+    if n_src < min_samples or n_tts < min_samples:
+        return np.interp(
+            np.linspace(0, n_tts - 1, n_src),
+            np.arange(n_tts),
+            tts,
+        ).astype(np.float32)
+
+    src_env = _rms_envelope(src)   # shape (N,)
+    tts_env = _rms_envelope(tts)   # shape (M,)
+
+    # DTW: wp is (path_len, 2) in DESCENDING order; wp[:, 0]=src, wp[:, 1]=tts
+    _, wp = librosa.sequence.dtw(
+        X=src_env.reshape(1, -1),
+        Y=tts_env.reshape(1, -1),
+    )
+    wp_asc = wp[::-1]  # ascending: first row = (0, 0)
+
+    src_path = wp_asc[:, 0].astype(np.float64)
+    tts_path = wp_asc[:, 1].astype(np.float64)
+
+    # For each src frame index → which tts frame to read
+    # DTW path may have duplicate src values; keep first occurrence per src frame
+    _, first = np.unique(src_path, return_index=True)
+    tts_frame_at_src = np.interp(
+        np.arange(len(src_env)),
+        src_path[first],
+        tts_path[first],
+    )
+
+    # Map each output sample to a tts sample position
+    # (frame-centre to sample: multiply by DTW_HOP)
+    tts_sample_at_src_frame = np.clip(tts_frame_at_src * DTW_HOP, 0, n_tts - 1)
+    frame_sample_axis = np.linspace(0, n_src - 1, len(tts_sample_at_src_frame))
+    tts_sample_at_out = np.interp(
+        np.arange(n_src),
+        frame_sample_axis,
+        tts_sample_at_src_frame,
+    )
+    tts_sample_at_out = np.clip(tts_sample_at_out, 0, n_tts - 1)
+
+    return np.interp(tts_sample_at_out, np.arange(n_tts), tts).astype(np.float32)
+
+
+# ── Main building block ───────────────────────────────────────────────────────
 
 def _build_synced_audio(
+    audio_path: str,
     segments: list,
     target_language: str,
     total_duration: float,
@@ -142,11 +196,10 @@ def _build_synced_audio(
 ) -> tuple[np.ndarray, str, str]:
     """
     For each Whisper segment:
-      1. Translate segment text
+      1. Translate
       2. Synthesize TTS
-      3. Time-stretch TTS to match segment duration
-      4. Place at correct position in output buffer
-
+      3. DTW-warp TTS energy peaks to align with source segment energy peaks
+      4. Place at source segment's start position
     Returns (audio_array, english_text, translated_text).
     """
     voice = LANGUAGES[target_language]["tts_voice"]
@@ -155,7 +208,9 @@ def _build_synced_audio(
     if lang_code != "en":
         ensure_translation_package("en", lang_code)
 
-    total_samples = int(total_duration * SAMPLE_RATE)
+    # Load full source audio once — needed for DTW energy reference
+    src_full, _ = librosa.load(audio_path, sr=SAMPLE_RATE, mono=True)
+    total_samples = max(int(total_duration * SAMPLE_RATE), len(src_full))
     out = np.zeros(total_samples, dtype=np.float32)
 
     all_english: list[str] = []
@@ -172,26 +227,36 @@ def _build_synced_audio(
         all_translated.append(translated)
 
         if progress_cb:
-            progress_cb(f"Segment {i+1}/{n}: {translated[:60]}")
+            progress_cb(f"Segment {i+1}/{n}: {translated[:70]}")
 
-        # TTS
+        # TTS synthesis
         with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
             tts_path = f.name
         _tts_run(translated, voice, tts_path)
         tts_wav, _ = librosa.load(tts_path, sr=SAMPLE_RATE, mono=True)
         Path(tts_path).unlink(missing_ok=True)
 
-        seg_duration = seg.end - seg.start
-        tts_stretched = _time_stretch_to_duration(tts_wav, seg_duration)
+        if len(tts_wav) == 0:
+            continue
 
-        start_s = int(seg.start * SAMPLE_RATE)
-        end_s = start_s + len(tts_stretched)
+        # Extract source segment for DTW energy reference
+        seg_start_s = int(seg.start * SAMPLE_RATE)
+        seg_end_s = min(int(seg.end * SAMPLE_RATE), len(src_full))
+        src_segment = src_full[seg_start_s:seg_end_s]
+
+        # DTW-warp TTS so its energy peaks align with source peaks
+        tts_warped = _dtw_warp_to_source(src_segment, tts_wav)
+
+        # Place in output buffer
+        end_s = seg_start_s + len(tts_warped)
         if end_s > len(out):
             out = np.pad(out, (0, end_s - len(out)))
-        out[start_s:end_s] += tts_stretched
+        out[seg_start_s:end_s] += tts_warped
 
     return out, " ".join(all_english), " ".join(all_translated)
 
+
+# ── Public pipeline entry point ───────────────────────────────────────────────
 
 def run_pipeline(
     audio_path: str,
@@ -207,8 +272,7 @@ def run_pipeline(
     Full pipeline: ASR → translate → TTS → (optional voice conversion).
 
     Args:
-        sync: if True, each segment is time-stretched to match source timing.
-
+        sync  : if True, DTW-align each TTS segment to source energy peaks.
     Returns:
         (english_text, translated_text)
     """
@@ -220,21 +284,21 @@ def run_pipeline(
     step("Transcribing audio (Whisper)...")
     whisper = get_whisper()
     segments_gen, info = whisper.transcribe(audio_path, task="translate", beam_size=5)
-    segments = list(segments_gen)  # materialise — needed for sync timing
+    segments = list(segments_gen)
     total_duration = info.duration
-    step(f"Detected language: [{info.language}], duration: {total_duration:.1f}s, {len(segments)} segments")
+    step(f"Detected [{info.language}], {total_duration:.1f}s, {len(segments)} segments")
 
     if sync:
-        step(f"Translating & synthesizing per-segment (sync mode)...")
+        step("Translating & synthesizing per-segment (DTW sync)...")
         audio_out, english_text, translated_text = _build_synced_audio(
-            segments, target_language, total_duration, progress_cb=step
+            audio_path, segments, target_language, total_duration, progress_cb=step
         )
     else:
         english_text = " ".join(s.text.strip() for s in segments)
         step(f"Translating full text → {target_language}...")
         translated_text = translate_en_to_target(english_text, target_language)
         step(f"Translated: {translated_text[:120]}")
-        step(f"Synthesizing speech ({LANGUAGES[target_language]['tts_voice']})...")
+        step(f"Synthesizing ({LANGUAGES[target_language]['tts_voice']})...")
         with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
             tts_path = f.name
         tts_to_file(translated_text, target_language, tts_path)
