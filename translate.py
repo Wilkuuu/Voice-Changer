@@ -29,7 +29,7 @@ import argostranslate.package
 import argostranslate.translate
 
 SAMPLE_RATE = 16000
-DTW_HOP = 160  # 10 ms frames at 16 kHz for energy envelope
+VAD_TOP_DB = 30  # silence threshold (dB below peak) for speech/silence split
 
 # Target languages: ISO 639-1 code + edge-tts neural voice
 LANGUAGES: dict[str, dict] = {
@@ -115,80 +115,71 @@ def tts_to_file(text: str, target_language: str, output_path: str) -> None:
     _tts_run(text, LANGUAGES[target_language]["tts_voice"], output_path)
 
 
-# ── DTW peak alignment ────────────────────────────────────────────────────────
+# ── Silence-aware fitting ─────────────────────────────────────────────────────
 
-def _rms_envelope(audio: np.ndarray) -> np.ndarray:
-    """Normalised RMS energy envelope at DTW_HOP resolution."""
-    env = librosa.feature.rms(y=audio, frame_length=512, hop_length=DTW_HOP)[0].astype(np.float32)
-    peak = env.max()
-    return env / (peak + 1e-8)
-
-
-def _dtw_warp_to_source(src: np.ndarray, tts: np.ndarray) -> np.ndarray:
+def _fit_by_silence(tts_wav: np.ndarray, target_samples: int) -> np.ndarray:
     """
-    Non-uniformly warp `tts` to match `src` duration by aligning their RMS
-    energy envelopes via DTW.  Output length equals len(src).
+    Fit TTS audio to target_samples by scaling ONLY the silence regions.
+    Speech portions are NEVER stretched or resampled — they play at natural speed.
 
-    This preserves natural TTS speed locally — peaks are aligned without
-    the artefacts of global uniform time-stretching.
+    Strategy:
+    - Detect speech/silence regions via VAD (librosa.effects.split)
+    - Distribute the silence budget proportionally across all silence gaps
+    - If speech alone exceeds target: return speech-only audio (trimmed to target)
+    - If no silences exist: pad with trailing silence
     """
-    n_src = len(src)
-    n_tts = len(tts)
+    if len(tts_wav) == 0:
+        return np.zeros(target_samples, dtype=np.float32)
 
-    if n_tts == 0:
-        return np.zeros(n_src, dtype=np.float32)
-    if n_src == 0:
-        return np.zeros(0, dtype=np.float32)
+    intervals = librosa.effects.split(tts_wav, top_db=VAD_TOP_DB)
 
-    # Short segments: simple linear resampling is fine
-    min_samples = 4 * DTW_HOP
-    if n_src < min_samples or n_tts < min_samples:
-        return np.interp(
-            np.linspace(0, n_tts - 1, n_src),
-            np.arange(n_tts),
-            tts,
-        ).astype(np.float32)
+    if len(intervals) == 0:
+        return np.zeros(target_samples, dtype=np.float32)
 
-    src_env = _rms_envelope(src)   # shape (N,)
-    tts_env = _rms_envelope(tts)   # shape (M,)
+    # Build list of silence lengths: [pre, between..., post]  (len = n_speech + 1)
+    n = len(intervals)
+    silence_orig = [int(intervals[0][0])]
+    for j in range(n - 1):
+        silence_orig.append(int(intervals[j + 1][0] - intervals[j][1]))
+    silence_orig.append(int(len(tts_wav) - intervals[-1][1]))
 
-    # DTW: wp is (path_len, 2) in DESCENDING order; wp[:, 0]=src, wp[:, 1]=tts
-    _, wp = librosa.sequence.dtw(
-        X=src_env.reshape(1, -1),
-        Y=tts_env.reshape(1, -1),
-    )
-    wp_asc = wp[::-1]  # ascending: first row = (0, 0)
+    speech_total = sum(int(e - s) for s, e in intervals)
 
-    src_path = wp_asc[:, 0].astype(np.float64)
-    tts_path = wp_asc[:, 1].astype(np.float64)
+    # If speech alone is already longer than target, concatenate speech and trim
+    if speech_total >= target_samples:
+        parts = [tts_wav[s:e] for s, e in intervals]
+        return np.concatenate(parts).astype(np.float32)[:target_samples]
 
-    # For each src frame index → which tts frame to read
-    # DTW path may have duplicate src values; keep first occurrence per src frame
-    _, first = np.unique(src_path, return_index=True)
-    tts_frame_at_src = np.interp(
-        np.arange(len(src_env)),
-        src_path[first],
-        tts_path[first],
-    )
+    silence_budget = target_samples - speech_total
+    orig_silence_total = sum(silence_orig)
 
-    # Map each output sample to a tts sample position
-    # (frame-centre to sample: multiply by DTW_HOP)
-    tts_sample_at_src_frame = np.clip(tts_frame_at_src * DTW_HOP, 0, n_tts - 1)
-    frame_sample_axis = np.linspace(0, n_src - 1, len(tts_sample_at_src_frame))
-    tts_sample_at_out = np.interp(
-        np.arange(n_src),
-        frame_sample_axis,
-        tts_sample_at_src_frame,
-    )
-    tts_sample_at_out = np.clip(tts_sample_at_out, 0, n_tts - 1)
+    if orig_silence_total > 0:
+        scale = silence_budget / orig_silence_total
+        new_silences = [max(0, round(s * scale)) for s in silence_orig]
+    else:
+        # No original silences: add all budget as trailing silence
+        new_silences = [0] * n + [silence_budget]
 
-    return np.interp(tts_sample_at_out, np.arange(n_tts), tts).astype(np.float32)
+    # Assemble: silence[j], speech[j], ..., speech[n-1], silence[n]
+    parts: list[np.ndarray] = []
+    for j, (s, e) in enumerate(intervals):
+        if new_silences[j] > 0:
+            parts.append(np.zeros(new_silences[j], dtype=np.float32))
+        parts.append(tts_wav[s:e].astype(np.float32))
+    if new_silences[-1] > 0:
+        parts.append(np.zeros(new_silences[-1], dtype=np.float32))
+
+    result = np.concatenate(parts).astype(np.float32) if parts else np.zeros(0, dtype=np.float32)
+
+    # Guarantee exact target length
+    if len(result) < target_samples:
+        result = np.pad(result, (0, target_samples - len(result)))
+    return result[:target_samples]
 
 
 # ── Main building block ───────────────────────────────────────────────────────
 
 def _build_synced_audio(
-    audio_path: str,
     segments: list,
     target_language: str,
     total_duration: float,
@@ -208,9 +199,7 @@ def _build_synced_audio(
     if lang_code != "en":
         ensure_translation_package("en", lang_code)
 
-    # Load full source audio once — needed for DTW energy reference
-    src_full, _ = librosa.load(audio_path, sr=SAMPLE_RATE, mono=True)
-    total_samples = max(int(total_duration * SAMPLE_RATE), len(src_full))
+    total_samples = int(total_duration * SAMPLE_RATE)
     out = np.zeros(total_samples, dtype=np.float32)
 
     all_english: list[str] = []
@@ -239,13 +228,12 @@ def _build_synced_audio(
         if len(tts_wav) == 0:
             continue
 
-        # Extract source segment for DTW energy reference
+        # Fit TTS to source segment duration by adjusting silences only
         seg_start_s = int(seg.start * SAMPLE_RATE)
-        seg_end_s = min(int(seg.end * SAMPLE_RATE), len(src_full))
-        src_segment = src_full[seg_start_s:seg_end_s]
+        seg_end_s = min(int(seg.end * SAMPLE_RATE), total_samples)
+        target_samples = seg_end_s - seg_start_s
 
-        # DTW-warp TTS so its energy peaks align with source peaks
-        tts_warped = _dtw_warp_to_source(src_segment, tts_wav)
+        tts_warped = _fit_by_silence(tts_wav, target_samples)
 
         # Place in output buffer
         end_s = seg_start_s + len(tts_warped)
@@ -291,7 +279,7 @@ def run_pipeline(
     if sync:
         step("Translating & synthesizing per-segment (DTW sync)...")
         audio_out, english_text, translated_text = _build_synced_audio(
-            audio_path, segments, target_language, total_duration, progress_cb=step
+            segments, target_language, total_duration, progress_cb=step
         )
     else:
         english_text = " ".join(s.text.strip() for s in segments)
