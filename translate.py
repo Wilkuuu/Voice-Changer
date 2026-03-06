@@ -3,9 +3,9 @@
 Translation pipeline: speech → text → translate → TTS → (voice conversion)
 
 Free tools used (all local except edge-tts):
-- faster-whisper : ASR + translate any language → English (local, int8 quantized)
-- Helsinki-NLP MarianMT : English → target language (local, HuggingFace)
-- edge-tts : Neural TTS in target language (free, Microsoft Edge voices, online)
+- faster-whisper  : ASR, translates any language → English (local, int8 CPU)
+- argostranslate  : English → target language (local, own package system)
+- edge-tts        : Neural TTS in target language (free, Microsoft Edge, online)
 """
 
 import asyncio
@@ -15,29 +15,30 @@ from pathlib import Path
 import librosa
 import soundfile as sf
 import torch
-from faster_whisper import WhisperModel
-from transformers import MarianMTModel, MarianTokenizer
-
 import edge_tts
+from faster_whisper import WhisperModel
+
+import argostranslate.package
+import argostranslate.translate
 
 SAMPLE_RATE = 16000
 
-# Target languages: MarianMT model + edge-tts neural voice
+# Target languages: ISO 639-1 code + edge-tts neural voice
 LANGUAGES: dict[str, dict] = {
-    "English":  {"mt_model": None,                          "tts_voice": "en-US-JennyNeural"},
-    "Polish":   {"mt_model": "Helsinki-NLP/opus-mt-en-pl",  "tts_voice": "pl-PL-ZofiaNeural"},
-    "German":   {"mt_model": "Helsinki-NLP/opus-mt-en-de",  "tts_voice": "de-DE-KatjaNeural"},
-    "French":   {"mt_model": "Helsinki-NLP/opus-mt-en-fr",  "tts_voice": "fr-FR-DeniseNeural"},
-    "Spanish":  {"mt_model": "Helsinki-NLP/opus-mt-en-es",  "tts_voice": "es-ES-ElviraNeural"},
-    "Italian":  {"mt_model": "Helsinki-NLP/opus-mt-en-it",  "tts_voice": "it-IT-ElsaNeural"},
-    "Russian":  {"mt_model": "Helsinki-NLP/opus-mt-en-ru",  "tts_voice": "ru-RU-SvetlanaNeural"},
-    "Ukrainian":{"mt_model": "Helsinki-NLP/opus-mt-en-uk",  "tts_voice": "uk-UA-PolinaNeural"},
-    "Dutch":    {"mt_model": "Helsinki-NLP/opus-mt-en-nl",  "tts_voice": "nl-NL-ColetteNeural"},
-    "Portuguese":{"mt_model":"Helsinki-NLP/opus-mt-en-pt",  "tts_voice": "pt-PT-RaquelNeural"},
+    "English":    {"lang_code": "en", "tts_voice": "en-US-JennyNeural"},
+    "Polish":     {"lang_code": "pl", "tts_voice": "pl-PL-ZofiaNeural"},
+    "German":     {"lang_code": "de", "tts_voice": "de-DE-KatjaNeural"},
+    "French":     {"lang_code": "fr", "tts_voice": "fr-FR-DeniseNeural"},
+    "Spanish":    {"lang_code": "es", "tts_voice": "es-ES-ElviraNeural"},
+    "Italian":    {"lang_code": "it", "tts_voice": "it-IT-ElsaNeural"},
+    "Russian":    {"lang_code": "ru", "tts_voice": "ru-RU-SvetlanaNeural"},
+    "Ukrainian":  {"lang_code": "uk", "tts_voice": "uk-UA-PolinaNeural"},
+    "Dutch":      {"lang_code": "nl", "tts_voice": "nl-NL-ColetteNeural"},
+    "Portuguese": {"lang_code": "pt", "tts_voice": "pt-PT-RaquelNeural"},
 }
 
 _whisper_model: WhisperModel | None = None
-_mt_models: dict = {}
+_installed_pairs: set[tuple[str, str]] = set()
 
 
 def get_whisper(model_size: str = "base") -> WhisperModel:
@@ -49,21 +50,50 @@ def get_whisper(model_size: str = "base") -> WhisperModel:
     return _whisper_model
 
 
-def get_mt_model(language: str) -> tuple:
-    if language not in _mt_models:
-        name = LANGUAGES[language]["mt_model"]
-        print(f"Loading translation model: {name}...")
-        tok = MarianTokenizer.from_pretrained(name)
-        mdl = MarianMTModel.from_pretrained(name).eval()
-        _mt_models[language] = (tok, mdl)
-        print("Translation model loaded.")
-    return _mt_models[language]
+def ensure_translation_package(from_code: str, to_code: str) -> None:
+    """Download and install argostranslate language pair if not already present."""
+    pair = (from_code, to_code)
+    if pair in _installed_pairs:
+        return
+
+    # Check already-installed packages
+    installed_langs = argostranslate.translate.get_installed_languages()
+    for lang in installed_langs:
+        if lang.code == from_code:
+            if any(t.to_lang.code == to_code for t in lang.translations_to):
+                _installed_pairs.add(pair)
+                return
+
+    print(f"Downloading translation package [{from_code}→{to_code}] (~50-100 MB)...")
+    argostranslate.package.update_package_index()
+    available = argostranslate.package.get_available_packages()
+    pkg = next(
+        (p for p in available if p.from_code == from_code and p.to_code == to_code),
+        None,
+    )
+    if pkg is None:
+        raise ValueError(
+            f"No argostranslate package available for [{from_code}→{to_code}]. "
+            f"Check https://www.argosopentech.com/argosmodel/"
+        )
+    argostranslate.package.install_from_path(pkg.download())
+    _installed_pairs.add(pair)
+    print("Translation package installed.")
+
+
+def translate_en_to_target(text: str, target_language: str) -> str:
+    """Translate English text → target language using argostranslate (local)."""
+    lang_code = LANGUAGES[target_language]["lang_code"]
+    if lang_code == "en":
+        return text
+    ensure_translation_package("en", lang_code)
+    return argostranslate.translate.translate(text, "en", lang_code)
 
 
 def transcribe_to_english(audio_path: str) -> tuple[str, str]:
     """
     Transcribe audio and translate to English using Whisper.
-    Works with any source language.
+    Works with any source language automatically.
     Returns (english_text, detected_source_language_code).
     """
     whisper = get_whisper()
@@ -72,29 +102,12 @@ def transcribe_to_english(audio_path: str) -> tuple[str, str]:
     return text, info.language
 
 
-def translate_en_to_target(english_text: str, target_language: str) -> str:
-    """Translate English text → target language using MarianMT."""
-    if LANGUAGES[target_language]["mt_model"] is None:
-        return english_text  # target is English, no translation needed
-    tok, mdl = get_mt_model(target_language)
-    inputs = tok(
-        english_text,
-        return_tensors="pt",
-        padding=True,
-        truncation=True,
-        max_length=512,
-    )
-    with torch.no_grad():
-        out = mdl.generate(**inputs, num_beams=4)
-    return tok.decode(out[0], skip_special_tokens=True)
-
-
 async def _tts_save(text: str, voice: str, path: str) -> None:
     await edge_tts.Communicate(text, voice).save(path)
 
 
 def text_to_speech(text: str, target_language: str, output_path: str) -> None:
-    """Synthesize speech using edge-tts neural voice."""
+    """Generate speech using a Microsoft Edge neural voice (free, online)."""
     voice = LANGUAGES[target_language]["tts_voice"]
     asyncio.run(_tts_save(text, voice, output_path))
 
@@ -114,7 +127,7 @@ def run_pipeline(
     Args:
         audio_path      : source audio file (any language)
         target_language : key from LANGUAGES dict
-        output_path     : where to save result (.wav)
+        output_path     : where to save the result (.wav)
         knn_vc          : loaded kNN-VC model (None = skip voice conversion)
         matching_set    : precomputed reference features (None = skip voice conversion)
         topk            : kNN top-k neighbors
@@ -130,9 +143,9 @@ def run_pipeline(
 
     step("Transcribing audio to English (Whisper)...")
     english_text, src_lang = transcribe_to_english(audio_path)
-    step(f"Detected language: [{src_lang}] → English: {english_text[:120]}")
+    step(f"Detected [{src_lang}] → English: {english_text[:120]}")
 
-    step(f"Translating English → {target_language} (MarianMT)...")
+    step(f"Translating English → {target_language} (argostranslate)...")
     translated_text = translate_en_to_target(english_text, target_language)
     step(f"Translated: {translated_text[:120]}")
 

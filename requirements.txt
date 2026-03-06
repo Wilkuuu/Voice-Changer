@@ -8,7 +8,5 @@ huggingface_hub
 
 # Translation pipeline
 faster-whisper
-transformers>=4.30.0
-sentencepiece
-sacremoses
+argostranslate
 edge-tts
