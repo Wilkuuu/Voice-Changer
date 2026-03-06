@@ -19,9 +19,9 @@ import soundfile as sf
 import torch
 
 import translate as tr
+from voice_utils import extract_features_chunked
 
 SAMPLE_RATE = 16000
-CHUNK_SECONDS = 15  # WavLM attention is O(N²); 15s chunks keep it manageable on CPU
 _model = None
 
 
@@ -47,71 +47,8 @@ def load_audio_array(path: str) -> torch.Tensor:
     return torch.from_numpy(wav).unsqueeze(0)  # (1, T)
 
 
-def extract_features_chunked(knn_vc, wav: torch.Tensor, progress: gr.Progress, base: float, span: float) -> torch.Tensor:
-    """Extract WavLM features in chunks to avoid O(N²) attention hang on long audio."""
-    chunk_samples = CHUNK_SECONDS * SAMPLE_RATE
-    total_samples = wav.shape[1]
-
-    if total_samples <= chunk_samples:
-        progress(base + span, desc="Extracting features...")
-        return knn_vc.get_features(wav)
-
-    chunks = []
-    n_chunks = (total_samples + chunk_samples - 1) // chunk_samples
-    for i, start in enumerate(range(0, total_samples, chunk_samples)):
-        end = min(start + chunk_samples, total_samples)
-        feats = knn_vc.get_features(wav[:, start:end])
-        chunks.append(feats)
-        frac = (i + 1) / n_chunks
-        progress(base + span * frac, desc=f"Extracting features: {end//SAMPLE_RATE}s / {total_samples//SAMPLE_RATE}s")
-
-    return torch.cat(chunks, dim=0)
-
-
-def run_translate_convert(input_audio, reference_audio, target_language, topk, progress=gr.Progress()):
-    """Translate speech and optionally apply voice conversion."""
-    if input_audio is None:
-        raise gr.Error("Please upload an input audio file.")
-
-    knn_vc = get_model()
-    device = next(knn_vc.parameters()).device
-
-    matching_set = None
-    if reference_audio is not None:
-        progress(0.05, desc="Building reference voice matching set...")
-        ref_wav = load_audio_array(reference_audio).to(device)
-        with torch.inference_mode():
-            matching_set = knn_vc.get_matching_set([ref_wav])
-
-    status_lines: list[str] = []
-
-    def log(msg: str):
-        status_lines.append(msg)
-        progress(min(0.1 + len(status_lines) * 0.15, 0.9), desc=msg)
-
-    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-        out_path = tmp.name
-
-    english_text, translated_text = tr.run_pipeline(
-        audio_path=input_audio,
-        target_language=target_language,
-        output_path=out_path,
-        knn_vc=knn_vc if matching_set is not None else None,
-        matching_set=matching_set,
-        topk=int(topk),
-        progress_cb=log,
-    )
-
-    out_wav, _ = librosa.load(out_path, sr=SAMPLE_RATE, mono=True)
-    Path(out_path).unlink(missing_ok=True)
-
-    progress(1.0, desc="Done.")
-    transcript = f"[English]\n{english_text}\n\n[{target_language}]\n{translated_text}"
-    return (SAMPLE_RATE, out_wav), transcript
-
-
 def run_conversion(input_audio, reference_audio, topk: int, progress=gr.Progress()):
-    """Gradio handler: takes file paths, returns (sample_rate, numpy_array)."""
+    """Tab 1: Voice conversion without translation."""
     if input_audio is None:
         raise gr.Error("Please upload an input audio file.")
     if reference_audio is None:
@@ -125,19 +62,63 @@ def run_conversion(input_audio, reference_audio, topk: int, progress=gr.Progress
     ref_wav = load_audio_array(reference_audio).to(device)
 
     with torch.inference_mode():
-        # Features for input: chunked (can be long)
-        query_seq = extract_features_chunked(knn_vc, src_wav, progress, base=0.05, span=0.60)
-
-        # Features for reference (usually short, one chunk)
+        query_seq = extract_features_chunked(
+            knn_vc, src_wav,
+            progress_cb=lambda msg: progress(None, desc=msg),
+        )
         progress(0.70, desc="Building reference matching set...")
         matching_set = knn_vc.get_matching_set([ref_wav])
-
         progress(0.80, desc="Running kNN matching + vocoding...")
         out_wav = knn_vc.match(query_seq, matching_set, topk=int(topk))
 
     progress(1.0, desc="Done.")
-    out_np = out_wav.squeeze().cpu().numpy()
-    return (SAMPLE_RATE, out_np)
+    return (SAMPLE_RATE, out_wav.squeeze().cpu().numpy())
+
+
+def run_translate_convert(
+    input_audio, reference_audio, target_language, topk, sync,
+    progress=gr.Progress(),
+):
+    """Tab 2: Translate speech and optionally apply voice conversion."""
+    if input_audio is None:
+        raise gr.Error("Please upload an input audio file.")
+
+    knn_vc = get_model()
+    device = next(knn_vc.parameters()).device
+
+    matching_set = None
+    if reference_audio is not None:
+        progress(0.05, desc="Building reference voice matching set...")
+        ref_wav = load_audio_array(reference_audio).to(device)
+        with torch.inference_mode():
+            matching_set = knn_vc.get_matching_set([ref_wav])
+
+    step_count = [0]
+
+    def log(msg: str):
+        step_count[0] += 1
+        progress(min(0.1 + step_count[0] * 0.10, 0.90), desc=msg)
+
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+        out_path = tmp.name
+
+    english_text, translated_text = tr.run_pipeline(
+        audio_path=input_audio,
+        target_language=target_language,
+        output_path=out_path,
+        knn_vc=knn_vc if matching_set is not None else None,
+        matching_set=matching_set,
+        topk=int(topk),
+        sync=bool(sync),
+        progress_cb=log,
+    )
+
+    out_wav, _ = librosa.load(out_path, sr=SAMPLE_RATE, mono=True)
+    Path(out_path).unlink(missing_ok=True)
+
+    progress(1.0, desc="Done.")
+    transcript = f"[English]\n{english_text}\n\n[{target_language}]\n{translated_text}"
+    return (SAMPLE_RATE, out_wav), transcript
 
 
 def build_ui():
@@ -171,18 +152,14 @@ def build_ui():
                     inputs=[vc_input, vc_ref, vc_topk],
                     outputs=[vc_output],
                 )
-
-                gr.Markdown(
-                    "**Tips:** Reference should be clean speech, 15-30s. "
-                    "Supports WAV, MP3, FLAC, OGG."
-                )
+                gr.Markdown("**Tips:** Reference should be clean speech, 15-30s. Supports WAV, MP3, FLAC, OGG.")
 
             # ── Tab 2: Translate & Convert ───────────────────────────────────
             with gr.Tab("Translate & Convert"):
                 gr.Markdown(
                     "Translate speech from **any language** to a target language, "
                     "then optionally apply voice conversion to match a reference speaker.\n\n"
-                    "Pipeline: **Whisper ASR** → **MarianMT translation** → "
+                    "Pipeline: **Whisper ASR** → **argostranslate** → "
                     "**edge-tts** → *(optional)* **kNN-VC voice conversion**"
                 )
                 with gr.Row():
@@ -196,6 +173,11 @@ def build_ui():
                             choices=list(tr.LANGUAGES.keys()),
                             value="Polish",
                             label="Target Language",
+                        )
+                        tr_sync = gr.Checkbox(
+                            value=True,
+                            label="Synchronize with source timing",
+                            info="Each segment is time-stretched to match the original audio timeline",
                         )
                         tr_topk = gr.Slider(
                             minimum=1, maximum=16, value=4, step=1,
@@ -213,14 +195,13 @@ def build_ui():
 
                 tr_btn.click(
                     fn=run_translate_convert,
-                    inputs=[tr_input, tr_ref, tr_lang, tr_topk],
+                    inputs=[tr_input, tr_ref, tr_lang, tr_topk, tr_sync],
                     outputs=[tr_output, tr_transcript],
                 )
-
                 gr.Markdown(
                     "**Tips:** "
                     "Reference voice is optional — without it you get translated TTS only. "
-                    "First use downloads Whisper (~150 MB) and MarianMT (~300 MB per language pair)."
+                    "First use downloads Whisper (~150 MB) and translation package (~80 MB per language)."
                 )
 
     return demo
@@ -233,7 +214,6 @@ def main():
     parser.add_argument("--host", default="127.0.0.1", help="Host to bind to")
     args = parser.parse_args()
 
-    # Pre-load model before starting UI
     get_model()
 
     demo = build_ui()
