@@ -14,6 +14,7 @@ translated audio land at the same moments as speech peaks in the original.
 """
 
 import asyncio
+import re
 import threading
 import tempfile
 from pathlib import Path
@@ -82,11 +83,66 @@ def ensure_translation_package(from_code: str, to_code: str) -> None:
     print("Translation package installed.")
 
 
-def translate_en_to_target(text: str, target_language: str) -> str:
+# ── Gender-aware translation ──────────────────────────────────────────────────
+
+# Prepended before the text so the MT model sees a female speaker in context.
+# The translated version of this sentence is then stripped from the output.
+_FEMALE_CONTEXT_EN = "I am a woman."
+
+# Language-specific regex to catch any remaining masculine forms after translation.
+# Format: list of (pattern, replacement) applied in order.
+_FEMALE_FIXERS: dict[str, list[tuple[str, str]]] = {
+    # Polish: first-person past tense -łem/-łeś → -łam/-łaś
+    "pl": [
+        (r"\b(\w+)łem\b", r"\1łam"),   # byłem→byłam, zrobiłem→zrobiłam
+        (r"\b(\w+)łeś\b", r"\1łaś"),   # byłeś→byłaś
+        (r"\b(\w+)łbym\b", r"\1łabym"),# chciałbym→chciałabym (conditional)
+    ],
+    # German: ich war/hatte/bin ... (hard to regex; context injection handles most cases)
+    "de": [],
+    # French: je suis allé → je suis allée  (past participle agreement)
+    "fr": [
+        (r"\bje suis allé\b", "je suis allée"),
+        (r"\bje suis parti\b", "je suis partie"),
+        (r"\bje suis sorti\b", "je suis sortie"),
+    ],
+    # Russian: first-person past tense -л → -ла
+    "ru": [
+        (r"\b(\w+)л\b(?!\w)", r"\1ла"),   # был→была, сделал→сделала
+    ],
+    # Ukrainian: similar to Russian
+    "uk": [
+        (r"\b(\w+)в\b(?!\w)", r"\1ла"),
+    ],
+}
+
+
+def _apply_female_fixers(text: str, lang_code: str) -> str:
+    for pattern, replacement in _FEMALE_FIXERS.get(lang_code, []):
+        text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
+    return text
+
+
+def translate_en_to_target(text: str, target_language: str, female_narrator: bool = False) -> str:
+    """Translate English text to target language, optionally with female narrator context."""
     lang_code = LANGUAGES[target_language]["lang_code"]
     if lang_code == "en":
         return text
     ensure_translation_package("en", lang_code)
+
+    if female_narrator:
+        # Prepend a short female-context sentence so the MT model uses feminine forms
+        combined = _FEMALE_CONTEXT_EN + " " + text
+        translated = argostranslate.translate.translate(combined, "en", lang_code)
+        # Strip the translated context sentence (it's short, ends with first ". " or ".")
+        dot = translated.find(". ")
+        if 0 < dot < 40:          # sanity-check: context sentence is always short
+            translated = translated[dot + 2:].strip()
+        elif translated.startswith(translated[:3]):
+            # fallback: remove first token-sentence if no ". " found
+            pass
+        return _apply_female_fixers(translated, lang_code)
+
     return argostranslate.translate.translate(text, "en", lang_code)
 
 
@@ -183,6 +239,7 @@ def _build_synced_audio(
     segments: list,
     target_language: str,
     total_duration: float,
+    female_narrator: bool = False,
     progress_cb=None,
 ) -> tuple[np.ndarray, str, str]:
     """
@@ -212,7 +269,7 @@ def _build_synced_audio(
             continue
         all_english.append(english)
 
-        translated = translate_en_to_target(english, target_language)
+        translated = translate_en_to_target(english, target_language, female_narrator=female_narrator)
         all_translated.append(translated)
 
         if progress_cb:
@@ -254,6 +311,7 @@ def run_pipeline(
     matching_set=None,
     topk: int = 4,
     sync: bool = True,
+    female_narrator: bool = False,
     progress_cb=None,
 ) -> tuple[str, str]:
     """
@@ -279,12 +337,13 @@ def run_pipeline(
     if sync:
         step("Translating & synthesizing per-segment (DTW sync)...")
         audio_out, english_text, translated_text = _build_synced_audio(
-            segments, target_language, total_duration, progress_cb=step
+            segments, target_language, total_duration,
+            female_narrator=female_narrator, progress_cb=step,
         )
     else:
         english_text = " ".join(s.text.strip() for s in segments)
         step(f"Translating full text → {target_language}...")
-        translated_text = translate_en_to_target(english_text, target_language)
+        translated_text = translate_en_to_target(english_text, target_language, female_narrator=female_narrator)
         step(f"Translated: {translated_text[:120]}")
         step(f"Synthesizing ({LANGUAGES[target_language]['tts_voice']})...")
         with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:

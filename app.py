@@ -76,7 +76,7 @@ def run_conversion(input_audio, reference_audio, topk: int, progress=gr.Progress
 
 
 def run_translate_convert(
-    input_audio, reference_audio, target_language, topk, sync,
+    input_audio, reference_audio, target_language, topk, sync, female_narrator,
     progress=gr.Progress(),
 ):
     """Tab 2: Translate speech and optionally apply voice conversion."""
@@ -110,6 +110,7 @@ def run_translate_convert(
         matching_set=matching_set,
         topk=int(topk),
         sync=bool(sync),
+        female_narrator=bool(female_narrator),
         progress_cb=log,
     )
 
@@ -174,10 +175,15 @@ def build_ui():
                             value="Polish",
                             label="Target Language",
                         )
+                        tr_female = gr.Checkbox(
+                            value=True,
+                            label="Female narrator",
+                            info="Use feminine grammatical forms in the translation",
+                        )
                         tr_sync = gr.Checkbox(
                             value=True,
                             label="Synchronize with source timing",
-                            info="Each segment is time-stretched to match the original audio timeline",
+                            info="Adjust silence gaps to match source segment duration (speech is never stretched)",
                         )
                         tr_topk = gr.Slider(
                             minimum=1, maximum=16, value=4, step=1,
@@ -195,7 +201,7 @@ def build_ui():
 
                 tr_btn.click(
                     fn=run_translate_convert,
-                    inputs=[tr_input, tr_ref, tr_lang, tr_topk, tr_sync],
+                    inputs=[tr_input, tr_ref, tr_lang, tr_topk, tr_sync, tr_female],
                     outputs=[tr_output, tr_transcript],
                 )
                 gr.Markdown(
