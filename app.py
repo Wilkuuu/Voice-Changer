@@ -9,8 +9,12 @@ Usage:
 """
 
 import argparse
+import os
 import tempfile
 from pathlib import Path
+
+# Must be set before CUDA initializes — reduces OOM from memory fragmentation
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import gradio as gr
 import librosa
@@ -19,7 +23,7 @@ import soundfile as sf
 import torch
 
 import translate as tr
-from voice_utils import extract_features_chunked
+from voice_utils import extract_features_chunked, get_matching_set_chunked, match_chunked
 
 SAMPLE_RATE = 16000
 _model = None
@@ -61,27 +65,66 @@ def run_conversion(input_audio, reference_audio, topk: int, progress=gr.Progress
     src_wav = load_audio_array(input_audio).to(device)
     ref_wav = load_audio_array(reference_audio).to(device)
 
-    with torch.inference_mode():
-        query_seq = extract_features_chunked(
-            knn_vc, src_wav,
-            progress_cb=lambda msg: progress(None, desc=msg),
-        )
-        progress(0.70, desc="Building reference matching set...")
-        matching_set = knn_vc.get_matching_set([ref_wav])
-        progress(0.80, desc="Running kNN matching + vocoding...")
-        out_wav = knn_vc.match(query_seq, matching_set, topk=int(topk))
+    def log(msg: str):
+        print(msg)
+        progress(None, desc=msg)
 
+    with torch.inference_mode():
+        # Build matching set FIRST while VRAM is clean (chunked — handles long ref audio)
+        progress(0.10, desc="Building reference matching set...")
+        matching_set = get_matching_set_chunked(knn_vc, ref_wav)
+        torch.cuda.empty_cache()
+
+        # Extract source features (chunked; periodic cache flush inside)
+        query_seq = extract_features_chunked(knn_vc, src_wav, progress_cb=log)
+        torch.cuda.empty_cache()
+
+        n_frames = query_seq.shape[0]
+        progress(0.80, desc=f"Vocoding {n_frames} frames in chunks...")
+        out_wav = match_chunked(knn_vc, query_seq, matching_set, topk=int(topk), progress_cb=log)
+
+    torch.cuda.empty_cache()
     progress(1.0, desc="Done.")
     return (SAMPLE_RATE, out_wav.squeeze().cpu().numpy())
 
 
-def run_translate_convert(
-    input_audio, reference_audio, target_language, topk, sync, female_narrator,
+def run_step1_transcribe(
+    input_audio, target_language, female_narrator,
     progress=gr.Progress(),
 ):
-    """Tab 2: Translate speech and optionally apply voice conversion."""
+    """Tab 2 Step 1: Whisper ASR → translate → return editable segment text."""
     if input_audio is None:
         raise gr.Error("Please upload an input audio file.")
+
+    step_count = [0]
+
+    def log(msg: str):
+        step_count[0] += 1
+        progress(min(0.05 + step_count[0] * 0.08, 0.95), desc=msg)
+
+    segments_text, total_duration = tr.transcribe_and_translate(
+        audio_path=input_audio,
+        target_language=target_language,
+        female_narrator=bool(female_narrator),
+        progress_cb=log,
+    )
+    progress(1.0, desc="Done. Edit segments below, then click Synthesize.")
+    return segments_text, total_duration
+
+
+def run_step2_synthesize(
+    edited_text, total_duration, reference_audio, target_language,
+    topk, sync, tts_rate_pct, tts_pitch_hz,
+    progress=gr.Progress(),
+):
+    """Tab 2 Step 2: TTS + optional voice conversion from edited segments."""
+    if not edited_text or not edited_text.strip():
+        raise gr.Error("No segments to synthesize. Run Step 1 first.")
+    if total_duration == 0:
+        raise gr.Error("Missing audio duration. Run Step 1 first.")
+
+    rate_str = f"{int(tts_rate_pct):+d}%"
+    pitch_str = f"{int(tts_pitch_hz):+d}Hz"
 
     knn_vc = get_model()
     device = next(knn_vc.parameters()).device
@@ -91,7 +134,7 @@ def run_translate_convert(
         progress(0.05, desc="Building reference voice matching set...")
         ref_wav = load_audio_array(reference_audio).to(device)
         with torch.inference_mode():
-            matching_set = knn_vc.get_matching_set([ref_wav])
+            matching_set = get_matching_set_chunked(knn_vc, ref_wav)
 
     step_count = [0]
 
@@ -102,15 +145,17 @@ def run_translate_convert(
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
         out_path = tmp.name
 
-    english_text, translated_text = tr.run_pipeline(
-        audio_path=input_audio,
+    tr.synthesize_from_edited(
+        edited_text=edited_text,
+        total_duration=float(total_duration),
         target_language=target_language,
         output_path=out_path,
         knn_vc=knn_vc if matching_set is not None else None,
         matching_set=matching_set,
         topk=int(topk),
         sync=bool(sync),
-        female_narrator=bool(female_narrator),
+        tts_rate=rate_str,
+        tts_pitch=pitch_str,
         progress_cb=log,
     )
 
@@ -118,8 +163,7 @@ def run_translate_convert(
     Path(out_path).unlink(missing_ok=True)
 
     progress(1.0, desc="Done.")
-    transcript = f"[English]\n{english_text}\n\n[{target_language}]\n{translated_text}"
-    return (SAMPLE_RATE, out_wav), transcript
+    return (SAMPLE_RATE, out_wav)
 
 
 def build_ui():
@@ -160,16 +204,17 @@ def build_ui():
                 gr.Markdown(
                     "Translate speech from **any language** to a target language, "
                     "then optionally apply voice conversion to match a reference speaker.\n\n"
-                    "Pipeline: **Whisper ASR** → **argostranslate** → "
-                    "**edge-tts** → *(optional)* **kNN-VC voice conversion**"
+                    "**Step 1:** Transcribe & translate → review/edit segments → "
+                    "**Step 2:** Synthesize & convert"
                 )
+                # Shared state: total audio duration returned by step 1
+                tr_duration = gr.State(0.0)
+
                 with gr.Row():
+                    # ── Step 1 inputs ────────────────────────────────────────
                     with gr.Column():
+                        gr.Markdown("### Step 1 — Transcribe & Translate")
                         tr_input = gr.Audio(label="Input Audio (any language)", type="filepath")
-                        tr_ref = gr.Audio(
-                            label="Reference Voice Sample (optional, for voice conversion)",
-                            type="filepath",
-                        )
                         tr_lang = gr.Dropdown(
                             choices=list(tr.LANGUAGES.keys()),
                             value="Polish",
@@ -179,6 +224,27 @@ def build_ui():
                             value=True,
                             label="Female narrator",
                             info="Use feminine grammatical forms in the translation",
+                        )
+                        tr_step1_btn = gr.Button("Transcribe & Translate", variant="primary")
+
+                    # ── Editable segments ────────────────────────────────────
+                    with gr.Column():
+                        gr.Markdown("### Translated Segments (editable)")
+                        tr_segments = gr.Textbox(
+                            label="Segments — format: [start - end] text",
+                            lines=12,
+                            interactive=True,
+                            placeholder="Click 'Transcribe & Translate' to populate this field.\n"
+                                        "Then edit any segment text before synthesizing.",
+                        )
+
+                with gr.Row():
+                    # ── Step 2 inputs ────────────────────────────────────────
+                    with gr.Column():
+                        gr.Markdown("### Step 2 — Synthesize & Convert")
+                        tr_ref = gr.Audio(
+                            label="Reference Voice Sample (optional, for voice conversion)",
+                            type="filepath",
                         )
                         tr_sync = gr.Checkbox(
                             value=True,
@@ -190,19 +256,32 @@ def build_ui():
                             label="Top-K Neighbors (used only with reference voice)",
                             info="Higher = smoother, lower = more expressive",
                         )
-                        tr_btn = gr.Button("Translate & Convert", variant="primary")
-                    with gr.Column():
-                        tr_output = gr.Audio(label="Output Audio", type="numpy")
-                        tr_transcript = gr.Textbox(
-                            label="Transcription & Translation",
-                            lines=6,
-                            interactive=False,
+                        tr_rate = gr.Slider(
+                            minimum=-30, maximum=30, value=0, step=1,
+                            label="TTS Speaking Rate (%)",
+                            info="Negative = slower, positive = faster. Default: 0",
                         )
+                        tr_pitch = gr.Slider(
+                            minimum=-20, maximum=20, value=0, step=1,
+                            label="TTS Pitch (Hz)",
+                            info="Negative = deeper voice, positive = higher pitch. Default: 0",
+                        )
+                        tr_step2_btn = gr.Button("Synthesize & Convert", variant="primary")
 
-                tr_btn.click(
-                    fn=run_translate_convert,
-                    inputs=[tr_input, tr_ref, tr_lang, tr_topk, tr_sync, tr_female],
-                    outputs=[tr_output, tr_transcript],
+                    # ── Output ───────────────────────────────────────────────
+                    with gr.Column():
+                        gr.Markdown("### Output")
+                        tr_output = gr.Audio(label="Output Audio", type="numpy")
+
+                tr_step1_btn.click(
+                    fn=run_step1_transcribe,
+                    inputs=[tr_input, tr_lang, tr_female],
+                    outputs=[tr_segments, tr_duration],
+                )
+                tr_step2_btn.click(
+                    fn=run_step2_synthesize,
+                    inputs=[tr_segments, tr_duration, tr_ref, tr_lang, tr_topk, tr_sync, tr_rate, tr_pitch],
+                    outputs=[tr_output],
                 )
                 gr.Markdown(
                     "**Tips:** "
@@ -218,7 +297,18 @@ def main():
     parser.add_argument("--port", type=int, default=7862, help="Port to listen on")
     parser.add_argument("--share", action="store_true", help="Create public Gradio link")
     parser.add_argument("--host", default="127.0.0.1", help="Host to bind to")
+    parser.add_argument(
+        "--low-vram", action="store_true",
+        help="Reduce GPU chunk sizes to avoid OOM on cards with <8 GB VRAM "
+             "(feature chunks: 5s, vocoder chunks: 300 frames)",
+    )
     args = parser.parse_args()
+
+    if args.low_vram:
+        import voice_utils
+        voice_utils.CHUNK_SECONDS = 5
+        voice_utils.MATCH_CHUNK_FRAMES = 300
+        print("Low-VRAM mode: feature chunks=5s, vocoder chunks=300 frames (~6s)")
 
     get_model()
 

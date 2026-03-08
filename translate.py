@@ -146,15 +146,20 @@ def translate_en_to_target(text: str, target_language: str, female_narrator: boo
     return argostranslate.translate.translate(text, "en", lang_code)
 
 
-def _tts_run(text: str, voice: str, path: str) -> None:
-    """Run edge-tts in a dedicated thread with its own event loop (no Gradio conflict)."""
+def _tts_run(text: str, voice: str, path: str, rate: str = "+0%", pitch: str = "+0Hz") -> None:
+    """Run edge-tts in a dedicated thread with its own event loop (no Gradio conflict).
+
+    rate  : speaking rate offset, e.g. "+0%", "-10%", "+20%"
+    pitch : pitch offset in Hz,   e.g. "+0Hz", "-5Hz",  "+10Hz"
+    """
     exc: list[Exception] = []
 
     def _worker():
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         try:
-            loop.run_until_complete(edge_tts.Communicate(text, voice).save(path))
+            comm = edge_tts.Communicate(text, voice, rate=rate, pitch=pitch)
+            loop.run_until_complete(comm.save(path))
         except Exception as e:
             exc.append(e)
         finally:
@@ -167,8 +172,9 @@ def _tts_run(text: str, voice: str, path: str) -> None:
         raise exc[0]
 
 
-def tts_to_file(text: str, target_language: str, output_path: str) -> None:
-    _tts_run(text, LANGUAGES[target_language]["tts_voice"], output_path)
+def tts_to_file(text: str, target_language: str, output_path: str,
+                rate: str = "+0%", pitch: str = "+0Hz") -> None:
+    _tts_run(text, LANGUAGES[target_language]["tts_voice"], output_path, rate=rate, pitch=pitch)
 
 
 # ── Silence-aware fitting ─────────────────────────────────────────────────────
@@ -240,6 +246,8 @@ def _build_synced_audio(
     target_language: str,
     total_duration: float,
     female_narrator: bool = False,
+    tts_rate: str = "+0%",
+    tts_pitch: str = "+0Hz",
     progress_cb=None,
 ) -> tuple[np.ndarray, str, str]:
     """
@@ -278,7 +286,7 @@ def _build_synced_audio(
         # TTS synthesis
         with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
             tts_path = f.name
-        _tts_run(translated, voice, tts_path)
+        _tts_run(translated, voice, tts_path, rate=tts_rate, pitch=tts_pitch)
         tts_wav, _ = librosa.load(tts_path, sr=SAMPLE_RATE, mono=True)
         Path(tts_path).unlink(missing_ok=True)
 
@@ -312,6 +320,8 @@ def run_pipeline(
     topk: int = 4,
     sync: bool = True,
     female_narrator: bool = False,
+    tts_rate: str = "+0%",
+    tts_pitch: str = "+0Hz",
     progress_cb=None,
 ) -> tuple[str, str]:
     """
@@ -338,7 +348,9 @@ def run_pipeline(
         step("Translating & synthesizing per-segment (DTW sync)...")
         audio_out, english_text, translated_text = _build_synced_audio(
             segments, target_language, total_duration,
-            female_narrator=female_narrator, progress_cb=step,
+            female_narrator=female_narrator,
+            tts_rate=tts_rate, tts_pitch=tts_pitch,
+            progress_cb=step,
         )
     else:
         english_text = " ".join(s.text.strip() for s in segments)
@@ -348,19 +360,147 @@ def run_pipeline(
         step(f"Synthesizing ({LANGUAGES[target_language]['tts_voice']})...")
         with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
             tts_path = f.name
-        tts_to_file(translated_text, target_language, tts_path)
+        tts_to_file(translated_text, target_language, tts_path, rate=tts_rate, pitch=tts_pitch)
         audio_out, _ = librosa.load(tts_path, sr=SAMPLE_RATE, mono=True)
         Path(tts_path).unlink(missing_ok=True)
 
     if knn_vc is not None and matching_set is not None:
         step("Applying voice conversion...")
-        from voice_utils import extract_features_chunked
+        from voice_utils import extract_features_chunked, match_chunked
         tensor = torch.from_numpy(audio_out).unsqueeze(0).to(next(knn_vc.parameters()).device)
         with torch.inference_mode():
             query_seq = extract_features_chunked(knn_vc, tensor, progress_cb=step)
-            out_wav = knn_vc.match(query_seq, matching_set, topk=topk)
+            out_wav = match_chunked(knn_vc, query_seq, matching_set, topk=topk, progress_cb=step)
+        torch.cuda.empty_cache()
         sf.write(output_path, out_wav.squeeze().cpu().numpy(), SAMPLE_RATE)
     else:
         sf.write(output_path, audio_out, SAMPLE_RATE)
 
     return english_text, translated_text
+
+
+# ── Two-step pipeline (for interactive text editing) ─────────────────────────
+
+_SEGMENT_RE = re.compile(r"^\[\s*(\d+(?:\.\d+)?)\s*-\s*(\d+(?:\.\d+)?)\s*\]\s*(.*)", re.MULTILINE)
+
+
+def transcribe_and_translate(
+    audio_path: str,
+    target_language: str,
+    female_narrator: bool = False,
+    progress_cb=None,
+) -> tuple[str, float]:
+    """
+    Step 1 of the two-step interactive pipeline.
+
+    Runs Whisper ASR → argostranslate per segment.
+    Returns (formatted_text, total_duration).
+
+    formatted_text is a multi-line string:
+        [0.00 - 3.45] Przetłumaczony tekst segmentu...
+        [3.45 - 7.12] Kolejny segment...
+
+    The user can edit this text in the UI; the [start - end] markers carry
+    timing information used in Step 2.
+    """
+    def step(msg: str):
+        print(msg)
+        if progress_cb:
+            progress_cb(msg)
+
+    step("Transcribing (Whisper)...")
+    whisper = get_whisper()
+    segments_gen, info = whisper.transcribe(audio_path, task="translate", beam_size=5)
+    segments = list(segments_gen)
+    step(f"Detected [{info.language}], {info.duration:.1f}s, {len(segments)} segments")
+
+    lang_code = LANGUAGES[target_language]["lang_code"]
+    if lang_code != "en":
+        ensure_translation_package("en", lang_code)
+
+    lines: list[str] = []
+    n = len(segments)
+    for i, seg in enumerate(segments):
+        english = seg.text.strip()
+        if not english:
+            continue
+        translated = translate_en_to_target(english, target_language, female_narrator=female_narrator)
+        step(f"Segment {i+1}/{n}: {translated[:70]}")
+        lines.append(f"[{seg.start:.2f} - {seg.end:.2f}] {translated}")
+
+    return "\n".join(lines), info.duration
+
+
+def synthesize_from_edited(
+    edited_text: str,
+    total_duration: float,
+    target_language: str,
+    output_path: str,
+    knn_vc=None,
+    matching_set=None,
+    topk: int = 4,
+    sync: bool = True,
+    tts_rate: str = "+0%",
+    tts_pitch: str = "+0Hz",
+    progress_cb=None,
+) -> None:
+    """
+    Step 2 of the two-step interactive pipeline.
+
+    Parses the user-edited segment text (format: "[start - end] text per line"),
+    synthesizes TTS for each segment, fits it to the original timing, then
+    optionally applies kNN-VC voice conversion.
+    """
+    def step(msg: str):
+        print(msg)
+        if progress_cb:
+            progress_cb(msg)
+
+    parsed = _SEGMENT_RE.findall(edited_text)
+    if not parsed:
+        raise ValueError("No segments found in edited text. Expected format: [start - end] Text...")
+
+    voice = LANGUAGES[target_language]["tts_voice"]
+    total_samples = int(total_duration * SAMPLE_RATE)
+    out = np.zeros(total_samples, dtype=np.float32)
+
+    n = len(parsed)
+    for i, (start_s, end_s, text) in enumerate(parsed):
+        text = text.strip()
+        if not text:
+            continue
+
+        start_f, end_f = float(start_s), float(end_s)
+        step(f"TTS {i+1}/{n}: {text[:70]}")
+
+        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
+            tts_path = f.name
+        _tts_run(text, voice, tts_path, rate=tts_rate, pitch=tts_pitch)
+        tts_wav, _ = librosa.load(tts_path, sr=SAMPLE_RATE, mono=True)
+        Path(tts_path).unlink(missing_ok=True)
+
+        if len(tts_wav) == 0:
+            continue
+
+        seg_start = int(start_f * SAMPLE_RATE)
+        seg_end = min(int(end_f * SAMPLE_RATE), total_samples)
+        target_samples = seg_end - seg_start
+
+        tts_warped = _fit_by_silence(tts_wav, target_samples) if sync else tts_wav
+
+        end_idx = seg_start + len(tts_warped)
+        if end_idx > len(out):
+            out = np.pad(out, (0, end_idx - len(out)))
+        out[seg_start:end_idx] += tts_warped
+
+    if knn_vc is not None and matching_set is not None:
+        step("Applying voice conversion...")
+        from voice_utils import extract_features_chunked, match_chunked
+        tensor = torch.from_numpy(out).unsqueeze(0).to(next(knn_vc.parameters()).device)
+        with torch.inference_mode():
+            query_seq = extract_features_chunked(knn_vc, tensor, progress_cb=step)
+            out_wav = match_chunked(knn_vc, query_seq, matching_set, topk=topk, progress_cb=step)
+        torch.cuda.empty_cache()
+        sf.write(output_path, out_wav.squeeze().cpu().numpy(), SAMPLE_RATE)
+    else:
+        sf.write(output_path, out, SAMPLE_RATE)
