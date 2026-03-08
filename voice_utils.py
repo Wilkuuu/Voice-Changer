@@ -108,13 +108,15 @@ def match_chunked(
     """
     if chunk_frames is None:
         chunk_frames = MATCH_CHUNK_FRAMES
+    # knn_vc.match() has device='cpu' as default but HiFiGAN must run on model's device
+    device = str(next(knn_vc.parameters()).device)
     total = query_seq.shape[0]
     if total <= chunk_frames:
         msg = f"Vocoding {total} frames..."
         print(msg)
         if progress_cb:
             progress_cb(msg)
-        return knn_vc.match(query_seq, matching_set, topk=topk)
+        return knn_vc.match(query_seq, matching_set, topk=topk, device=device)
 
     n_chunks = math.ceil(total / chunk_frames)
     parts: list[torch.Tensor] = []
@@ -123,13 +125,11 @@ def match_chunked(
         start = i * chunk_frames
         end = min(start + chunk_frames, total)
 
-        # Add overlap for HiFiGAN receptive field context
         s_ext = max(0, start - MATCH_OVERLAP_FRAMES)
         e_ext = min(total, end + MATCH_OVERLAP_FRAMES)
 
-        wav = knn_vc.match(query_seq[s_ext:e_ext], matching_set, topk=topk).squeeze()
+        wav = knn_vc.match(query_seq[s_ext:e_ext], matching_set, topk=topk, device=device).squeeze()
 
-        # Trim the overlap we added
         trim_start = (start - s_ext) * _WAVLM_HOP
         trim_end = (e_ext - end) * _WAVLM_HOP
         wav = wav[trim_start: len(wav) - trim_end if trim_end else len(wav)]
@@ -139,6 +139,8 @@ def match_chunked(
         print(msg)
         if progress_cb:
             progress_cb(msg)
+
+        torch.cuda.empty_cache()
 
     return torch.cat(parts).unsqueeze(0)
 
