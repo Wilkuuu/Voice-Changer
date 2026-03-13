@@ -69,8 +69,13 @@ def load_audio_array(path: str) -> torch.Tensor:
     return torch.from_numpy(wav).unsqueeze(0)  # (1, T)
 
 
-def run_conversion(input_audio, reference_audio, vc_model, tau, temperature, progress=gr.Progress()):
-    """Tab 1: Voice conversion — Chatterbox VC or OpenVoice."""
+def run_conversion(
+    input_audio, reference_audio, vc_model,
+    cb_exaggeration, cb_cfg_weight,
+    tau, temperature,
+    progress=gr.Progress(),
+):
+    """Tab 1: Voice conversion — Chatterbox VC, Chatterbox TTS, or OpenVoice."""
     input_path = _audio_path(input_audio)
     ref_path = _audio_path(reference_audio)
     if not input_path or not Path(input_path).exists():
@@ -86,13 +91,9 @@ def run_conversion(input_audio, reference_audio, vc_model, tau, temperature, pro
             progress(None, desc=msg)
 
     if vc_model == "Chatterbox VC":
-        try:
-            import chatterbox_engine
-            if not chatterbox_engine.is_vc_available():
-                raise gr.Error("Chatterbox VC not available. Run: pip install chatterbox-tts")
-        except ImportError:
-            raise gr.Error("Chatterbox not installed. Run: pip install chatterbox-tts")
-
+        import chatterbox_engine
+        if not chatterbox_engine.is_vc_available():
+            raise gr.Error("Chatterbox VC not available. Run: pip install chatterbox-tts")
         log_progress("Loading Chatterbox VC model (first run downloads weights)...", 0.0)
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
             out_path = tmp.name
@@ -104,17 +105,54 @@ def run_conversion(input_audio, reference_audio, vc_model, tau, temperature, pro
             )
         except Exception as e:
             Path(out_path).unlink(missing_ok=True)
-            print(f"[Voice Conversion] ERROR: {e}", flush=True)
             raise gr.Error(f"Chatterbox VC failed: {e}") from e
+        log_progress("Done.", 1.0)
+        return out_path
+
+    elif vc_model == "Chatterbox TTS":
+        import chatterbox_engine
+        if not chatterbox_engine.is_available():
+            raise gr.Error("Chatterbox not available. Run: pip install chatterbox-tts")
+        log_progress("Transcribing input audio with Whisper...", 0.1)
+        # Transcribe input to get the text
+        segments_text, _ = tr.transcribe_and_translate(
+            audio_path=input_path,
+            target_language="English",
+            female_narrator=False,
+            progress_cb=lambda msg: log_progress(msg),
+        )
+        # Extract plain text from segments
+        lines = []
+        for line in segments_text.strip().splitlines():
+            line = line.strip()
+            if line.startswith("[") and "]" in line:
+                text_part = line.split("]", 1)[1].strip()
+                if text_part:
+                    lines.append(text_part)
+        full_text = " ".join(lines)
+        if not full_text:
+            raise gr.Error("Could not extract text from input audio.")
+        log_progress("Synthesizing with Chatterbox TTS...", 0.5)
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+            out_path = tmp.name
+        try:
+            chatterbox_engine.synthesize(
+                text=full_text,
+                language="en",
+                ref_audio_path=ref_path,
+                output_path=out_path,
+                exaggeration=float(cb_exaggeration),
+                cfg_weight=float(cb_cfg_weight),
+            )
+        except Exception as e:
+            Path(out_path).unlink(missing_ok=True)
+            raise gr.Error(f"Chatterbox TTS failed: {e}") from e
         log_progress("Done.", 1.0)
         return out_path
 
     else:  # OpenVoice
         if not openvoice_available():
-            raise gr.Error(
-                "OpenVoice is not installed.\n"
-                "  pip install openvoice-cli"
-            )
+            raise gr.Error("OpenVoice is not installed. Run: pip install openvoice-cli")
         log_progress("Starting OpenVoice conversion (chunked to reduce VRAM)...", 0.0)
         try:
             out_path = openvoice_convert(
@@ -129,7 +167,6 @@ def run_conversion(input_audio, reference_audio, vc_model, tau, temperature, pro
                 use_cpu_fallback_on_oom=True,
             )
         except Exception as e:
-            print(f"[Voice Conversion] ERROR: {e}", flush=True)
             raise gr.Error(f"OpenVoice conversion failed: {e}") from e
         log_progress("Done.", 1.0)
         return out_path
@@ -336,9 +373,10 @@ def build_ui():
             # ── Tab 1: Voice Conversion ──────────────────────────────────────
             with gr.Tab("Voice Conversion"):
                 gr.Markdown(
-                    "Convert voice in input audio to match a reference speaker. "
-                    "Choose between **Chatterbox VC** (higher quality, S3 token resynthesis) "
-                    "or **OpenVoice** (tone-color transfer, faster)."
+                    "Skonwertuj głos z nagrania wejściowego na głos z próbki referencyjnej. "
+                    "Trzy tryby: **Chatterbox VC** (resynteza przez S3), "
+                    "**Chatterbox TTS** (transkrypcja → TTS z klonowaniem głosu), "
+                    "**OpenVoice** (transfer tonu)."
                 )
                 with gr.Row():
                     with gr.Column():
@@ -347,15 +385,27 @@ def build_ui():
                             label="Reference Voice Sample (5–30 s)", type="filepath"
                         )
                         vc_model_radio = gr.Radio(
-                            choices=["Chatterbox VC", "OpenVoice"],
+                            choices=["Chatterbox VC", "Chatterbox TTS", "OpenVoice"],
                             value="Chatterbox VC",
                             label="Conversion Model",
                         )
-                        with gr.Group(visible=True) as vc_group_chatterbox:
+                        with gr.Group(visible=True) as vc_group_chatterbox_vc:
                             gr.Markdown(
-                                "**Chatterbox VC** — resyntezuje treść audio z głosem z nagrania "
-                                "referencyjnego przez tokenizer S3. Brak dodatkowych parametrów — "
-                                "wystarczy nagranie wejściowe i próbka głosu."
+                                "**Chatterbox VC** — resyntezuje audio zachowując treść, "
+                                "aplikując tembr głosu z próbki referencyjnej (tokenizer S3). "
+                                "Brak dodatkowych parametrów."
+                            )
+                        with gr.Group(visible=False) as vc_group_chatterbox_tts:
+                            gr.Markdown("**Chatterbox TTS** — transkrypcja Whisper → synteza TTS z klonowaniem głosu")
+                            vc_cb_exaggeration = gr.Slider(
+                                minimum=0.0, maximum=1.0, value=0.5, step=0.05,
+                                label="Emotion exaggeration",
+                                info="Higher = more expressive/dramatic speech.",
+                            )
+                            vc_cb_cfg = gr.Slider(
+                                minimum=0.0, maximum=1.0, value=0.5, step=0.05,
+                                label="CFG weight (guidance)",
+                                info="Higher = more faithful to reference voice.",
                             )
                         with gr.Group(visible=False) as vc_group_openvoice:
                             gr.Markdown("**OpenVoice settings**")
@@ -376,22 +426,28 @@ def build_ui():
                 def _update_vc_model_ui(model):
                     return (
                         gr.update(visible=model == "Chatterbox VC"),
+                        gr.update(visible=model == "Chatterbox TTS"),
                         gr.update(visible=model == "OpenVoice"),
                     )
 
                 vc_model_radio.change(
                     fn=_update_vc_model_ui,
                     inputs=[vc_model_radio],
-                    outputs=[vc_group_chatterbox, vc_group_openvoice],
+                    outputs=[vc_group_chatterbox_vc, vc_group_chatterbox_tts, vc_group_openvoice],
                 )
                 vc_btn.click(
                     fn=run_conversion,
-                    inputs=[vc_input, vc_ref, vc_model_radio, vc_tau, vc_temperature],
+                    inputs=[
+                        vc_input, vc_ref, vc_model_radio,
+                        vc_cb_exaggeration, vc_cb_cfg,
+                        vc_tau, vc_temperature,
+                    ],
                     outputs=[vc_output],
                 )
                 gr.Markdown(
-                    "**Tips:** Use 5–30 s of clean reference speech (one speaker, little noise). "
-                    "Chatterbox VC downloads weights on first use (~500 MB). "
+                    "**Tips:** Use 5–30 s of clean reference speech. "
+                    "Chatterbox VC/TTS download weights on first use. "
+                    "Chatterbox TTS transcribes the input audio first, then re-synthesizes in the reference voice. "
                     "OpenVoice requires: `pip install openvoice-cli`."
                 )
 
