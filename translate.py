@@ -431,6 +431,117 @@ def transcribe_and_translate(
     return "\n".join(lines), info.duration
 
 
+def parse_srt(srt_content: str) -> tuple[str, float]:
+    """Parse SRT file content into the segments format used by the app.
+
+    Returns (segments_text, total_duration) where segments_text is:
+        [start - end] text
+        ...
+    and total_duration is the end time of the last segment (in seconds).
+    """
+    ts_re = re.compile(
+        r"(\d{2}):(\d{2}):(\d{2})[,.](\d{3})\s*-->\s*(\d{2}):(\d{2}):(\d{2})[,.](\d{3})"
+    )
+
+    lines: list[str] = []
+    total_duration = 0.0
+
+    blocks = re.split(r"\n\s*\n", srt_content.strip())
+    for block in blocks:
+        block = block.strip()
+        if not block:
+            continue
+        block_lines = block.splitlines()
+
+        ts_match = None
+        ts_idx = None
+        for j, line in enumerate(block_lines):
+            m = ts_re.match(line.strip())
+            if m:
+                ts_match = m
+                ts_idx = j
+                break
+        if ts_match is None:
+            continue
+
+        h1, m1, s1, ms1 = (int(ts_match.group(k)) for k in (1, 2, 3, 4))
+        h2, m2, s2, ms2 = (int(ts_match.group(k)) for k in (5, 6, 7, 8))
+        start = h1 * 3600 + m1 * 60 + s1 + ms1 / 1000
+        end   = h2 * 3600 + m2 * 60 + s2 + ms2 / 1000
+
+        text = " ".join(block_lines[ts_idx + 1:]).strip()
+        if not text:
+            continue
+
+        total_duration = max(total_duration, end)
+        lines.append(f"[{start:.2f} - {end:.2f}] {text}")
+
+    return "\n".join(lines), total_duration
+
+
+def polish_segments_with_ai(
+    segments_text: str,
+    lang_code: str = "pl",
+    context_hint: str = "",
+    api_key: str = "",
+) -> str:
+    """
+    Use Claude API to fix grammar, coherence, and text length of translated segments.
+
+    Segments format:  [start - end] text
+    Duration of each segment (end - start) is used to guide text length.
+    Returns improved segments in the same format.
+    """
+    import os
+    import anthropic
+
+    key = api_key.strip() or os.environ.get("ANTHROPIC_API_KEY", "")
+    if not key:
+        raise ValueError(
+            "Anthropic API key is required. Set ANTHROPIC_API_KEY env var or paste it in the UI."
+        )
+
+    # Annotate each segment with duration so the model can judge appropriate text length
+    parsed = _SEGMENT_RE.findall(segments_text)
+    if not parsed:
+        raise ValueError("No segments found. Expected format: [start - end] Text")
+
+    annotated_lines: list[str] = []
+    for start_s, end_s, text in parsed:
+        duration = float(end_s) - float(start_s)
+        annotated_lines.append(f"[{float(start_s):.2f} - {float(end_s):.2f}] ({duration:.1f}s) {text.strip()}")
+
+    context_block = f"\nNarrative context: {context_hint.strip()}" if context_hint.strip() else ""
+
+    system_prompt = (
+        f"You are a professional text editor for speech synthesis. "
+        f"You receive transcribed/translated speech segments with timestamps and durations. "
+        f"Your task:\n"
+        f"1. Fix all grammar, typo, and transcription errors\n"
+        f"2. Make the text coherent and natural as spoken dialogue\n"
+        f"3. Adjust text length to match the segment duration — a {lang_code} TTS voice speaks "
+        f"   roughly 2–3 words per second. Short segments (<1s) = 2–4 words max. "
+        f"   Long segments (>10s) = several sentences.\n"
+        f"4. Preserve the original meaning and tone\n"
+        f"5. Output ONLY the corrected segments, one per line, in the EXACT same format: "
+        f"   [start - end] corrected text\n"
+        f"   Do NOT include the duration annotation in output.\n"
+        f"   Do NOT add explanations, notes, or extra lines.{context_block}"
+    )
+
+    user_msg = "\n".join(annotated_lines)
+
+    client = anthropic.Anthropic(api_key=key)
+    response = client.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=4096,
+        messages=[{"role": "user", "content": user_msg}],
+        system=system_prompt,
+    )
+
+    return response.content[0].text.strip()
+
+
 def synthesize_from_edited(
     edited_text: str,
     total_duration: float,

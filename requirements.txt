@@ -6,7 +6,13 @@ librosa
 gradio>=4.0.0
 huggingface_hub
 
+# Natural voice conversion (branch natural-clone)
+openvoice-cli
+
 # Translation pipeline
 faster-whisper
 argostranslate
 edge-tts
+
+# AI segment polishing
+anthropic>=0.20.0

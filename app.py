@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """
-Gradio web interface for zero-shot voice conversion using kNN-VC.
+Gradio web interface for natural voice conversion (OpenVoice) and translation pipeline.
+
+Voice Conversion tab: OpenVoice tone-color transfer (GPU, natural cloning).
+Translate & Convert tab: Whisper + TTS + optional kNN-VC.
 
 Usage:
     python app.py
@@ -25,6 +28,12 @@ import torch
 import translate as tr
 from voice_utils import extract_features_chunked, get_matching_set_chunked, match_chunked
 
+try:
+    from openvoice_engine import is_available as openvoice_available, convert as openvoice_convert
+except ImportError:
+    openvoice_available = lambda: False
+    openvoice_convert = None
+
 SAMPLE_RATE = 16000
 _model = None
 
@@ -46,46 +55,99 @@ def get_model():
     return _model
 
 
+def _audio_path(value):
+    """Normalize Gradio Audio value to file path (str). Handles type='filepath' and dict from some Gradio 4 flows."""
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        return value.get("name") or value.get("path") or value.get("filename")
+    return str(value) if value else None
+
+
 def load_audio_array(path: str) -> torch.Tensor:
-    wav, _ = librosa.load(path, sr=SAMPLE_RATE, mono=True)
+    try:
+        wav, _ = librosa.load(path, sr=SAMPLE_RATE, mono=True, res_type="soxr_hq")
+    except Exception:
+        wav, _ = librosa.load(path, sr=SAMPLE_RATE, mono=True)
     return torch.from_numpy(wav).unsqueeze(0)  # (1, T)
 
 
-def run_conversion(input_audio, reference_audio, topk: int, progress=gr.Progress()):
-    """Tab 1: Voice conversion without translation."""
-    if input_audio is None:
+def run_conversion(input_audio, reference_audio, tau, temperature, progress=gr.Progress()):
+    """Tab 1: Voice conversion using OpenVoice (natural tone-color transfer)."""
+    input_path = _audio_path(input_audio)
+    ref_path = _audio_path(reference_audio)
+    if not input_path or not Path(input_path).exists():
         raise gr.Error("Please upload an input audio file.")
-    if reference_audio is None:
+    if not ref_path or not Path(ref_path).exists():
         raise gr.Error("Please upload a reference voice sample.")
 
-    knn_vc = get_model()
-    device = next(knn_vc.parameters()).device
+    if not openvoice_available():
+        raise gr.Error(
+            "OpenVoice is not installed. Install it for natural voice cloning:\n"
+            "  pip install openvoice-cli\n"
+            "For GPU: pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu118"
+        )
 
-    progress(0.0, desc="Loading audio...")
-    src_wav = load_audio_array(input_audio).to(device)
-    ref_wav = load_audio_array(reference_audio).to(device)
+    def log_progress(msg: str, p: float | None = None) -> None:
+        print(f"[Voice Conversion] {msg}", flush=True)
+        if p is not None:
+            progress(float(p), desc=msg)
+        else:
+            progress(None, desc=msg)
 
-    def log(msg: str):
-        print(msg)
-        progress(None, desc=msg)
+    log_progress("Starting OpenVoice conversion (chunked to reduce VRAM)...", 0.0)
+    try:
+        out_path = openvoice_convert(
+            input_path=input_path,
+            ref_path=ref_path,
+            output_path=None,
+            device=None,
+            tau=float(tau),
+            temperature=float(temperature),
+            chunk_duration_sec=18,
+            progress_cb=log_progress,
+            use_cpu_fallback_on_oom=True,
+        )
+    except Exception as e:
+        print(f"[Voice Conversion] ERROR: {e}", flush=True)
+        raise gr.Error(f"Voice conversion failed: {e}") from e
+    log_progress("Done.", 1.0)
+    return out_path
 
-    with torch.inference_mode():
-        # Build matching set FIRST while VRAM is clean (chunked — handles long ref audio)
-        progress(0.10, desc="Building reference matching set...")
-        matching_set = get_matching_set_chunked(knn_vc, ref_wav)
-        torch.cuda.empty_cache()
 
-        # Extract source features (chunked; periodic cache flush inside)
-        query_seq = extract_features_chunked(knn_vc, src_wav, progress_cb=log)
-        torch.cuda.empty_cache()
+def load_from_srt(srt_file):
+    """Load segments from an uploaded SRT file (alternative to Step 1 transcription)."""
+    if srt_file is None:
+        raise gr.Error("Please upload an SRT file.")
+    srt_path = str(srt_file)
+    if not Path(srt_path).exists():
+        raise gr.Error("SRT file not found.")
+    content = Path(srt_path).read_text(encoding="utf-8", errors="replace")
+    segments_text, total_duration = tr.parse_srt(content)
+    if not segments_text:
+        raise gr.Error("No segments found in the SRT file. Check that it is a valid SRT.")
+    return segments_text, total_duration
 
-        n_frames = query_seq.shape[0]
-        progress(0.80, desc=f"Vocoding {n_frames} frames in chunks...")
-        out_wav = match_chunked(knn_vc, query_seq, matching_set, topk=int(topk), progress_cb=log)
 
-    torch.cuda.empty_cache()
+def run_polish_with_ai(segments_text, target_language, context_hint, api_key, progress=gr.Progress()):
+    """Polish/fix segments using Claude AI."""
+    if not segments_text or not segments_text.strip():
+        raise gr.Error("No segments to polish. Run Step 1 or load an SRT first.")
+    lang_code = tr.LANGUAGES[target_language]["lang_code"]
+    progress(0.2, desc="Sending segments to Claude AI...")
+    try:
+        result = tr.polish_segments_with_ai(
+            segments_text=segments_text,
+            lang_code=lang_code,
+            context_hint=context_hint,
+            api_key=api_key,
+        )
+    except ValueError as e:
+        raise gr.Error(str(e))
+    except Exception as e:
+        raise gr.Error(f"AI polishing failed: {e}")
     progress(1.0, desc="Done.")
-    return (SAMPLE_RATE, out_wav.squeeze().cpu().numpy())
+    return result
 
 
 def run_step1_transcribe(
@@ -93,7 +155,8 @@ def run_step1_transcribe(
     progress=gr.Progress(),
 ):
     """Tab 2 Step 1: Whisper ASR → translate → return editable segment text."""
-    if input_audio is None:
+    input_path = _audio_path(input_audio)
+    if not input_path or not Path(input_path).exists():
         raise gr.Error("Please upload an input audio file.")
 
     step_count = [0]
@@ -103,7 +166,7 @@ def run_step1_transcribe(
         progress(min(0.05 + step_count[0] * 0.08, 0.95), desc=msg)
 
     segments_text, total_duration = tr.transcribe_and_translate(
-        audio_path=input_audio,
+        audio_path=input_path,
         target_language=target_language,
         female_narrator=bool(female_narrator),
         progress_cb=log,
@@ -130,9 +193,10 @@ def run_step2_synthesize(
     device = next(knn_vc.parameters()).device
 
     matching_set = None
-    if reference_audio is not None:
+    ref_path = _audio_path(reference_audio) if reference_audio else None
+    if ref_path and Path(ref_path).exists():
         progress(0.05, desc="Building reference voice matching set...")
-        ref_wav = load_audio_array(reference_audio).to(device)
+        ref_wav = load_audio_array(ref_path).to(device)
         with torch.inference_mode():
             matching_set = get_matching_set_chunked(knn_vc, ref_wav)
 
@@ -174,30 +238,44 @@ def build_ui():
             # ── Tab 1: Voice Conversion ──────────────────────────────────────
             with gr.Tab("Voice Conversion"):
                 gr.Markdown(
-                    "Convert voice in input audio to match a reference speaker. "
-                    "No training required."
+                    "Convert voice in input audio to match a reference speaker using **OpenVoice** "
+                    "(tone-color transfer). Natural cloning, no training, GPU-accelerated."
                 )
                 with gr.Row():
                     with gr.Column():
                         vc_input = gr.Audio(label="Input Audio", type="filepath")
                         vc_ref = gr.Audio(
-                            label="Reference Voice Sample (5-30s)", type="filepath"
+                            label="Reference Voice Sample (5–30 s)", type="filepath"
                         )
-                        vc_topk = gr.Slider(
-                            minimum=1, maximum=16, value=4, step=1,
-                            label="Top-K Neighbors",
-                            info="Higher = smoother, lower = more expressive",
+                        vc_tau = gr.Slider(
+                            minimum=0.3,
+                            maximum=1.0,
+                            value=0.65,
+                            step=0.05,
+                            label="Reference voice strength (tau)",
+                            info="Higher = output closer to reference.",
+                        )
+                        vc_temperature = gr.Slider(
+                            minimum=0.7,
+                            maximum=1.3,
+                            value=1.0,
+                            step=0.05,
+                            label="Voice temperature",
+                            info="Higher = warmer, more expressive; lower = calmer, more even.",
                         )
                         vc_btn = gr.Button("Convert Voice", variant="primary")
                     with gr.Column():
-                        vc_output = gr.Audio(label="Converted Audio", type="numpy")
+                        vc_output = gr.Audio(label="Converted Audio", type="filepath")
 
                 vc_btn.click(
                     fn=run_conversion,
-                    inputs=[vc_input, vc_ref, vc_topk],
+                    inputs=[vc_input, vc_ref, vc_tau, vc_temperature],
                     outputs=[vc_output],
                 )
-                gr.Markdown("**Tips:** Reference should be clean speech, 15-30s. Supports WAV, MP3, FLAC, OGG.")
+                gr.Markdown(
+                    "**Tips:** Use 5–30 s of clean reference speech (one speaker, little noise). "
+                    "Requires: `pip install openvoice-cli` (and CUDA PyTorch for GPU)."
+                )
 
             # ── Tab 2: Translate & Convert ───────────────────────────────────
             with gr.Tab("Translate & Convert"):
@@ -226,6 +304,9 @@ def build_ui():
                             info="Use feminine grammatical forms in the translation",
                         )
                         tr_step1_btn = gr.Button("Transcribe & Translate", variant="primary")
+                        gr.Markdown("**— or load from SRT —**")
+                        tr_srt = gr.File(label="SRT File", file_types=[".srt"], type="filepath")
+                        tr_srt_btn = gr.Button("Load SRT")
 
                     # ── Editable segments ────────────────────────────────────
                     with gr.Column():
@@ -237,6 +318,21 @@ def build_ui():
                             placeholder="Click 'Transcribe & Translate' to populate this field.\n"
                                         "Then edit any segment text before synthesizing.",
                         )
+
+                with gr.Row():
+                    with gr.Column():
+                        gr.Markdown("### AI Segment Polishing (optional)")
+                        tr_context = gr.Textbox(
+                            label="Narrative context / style hint",
+                            placeholder="e.g. Erotic monologue of a girl speaking to a male listener. Polish language.",
+                            lines=2,
+                        )
+                        tr_api_key = gr.Textbox(
+                            label="Anthropic API Key (or set ANTHROPIC_API_KEY env var)",
+                            placeholder="sk-ant-...",
+                            type="password",
+                        )
+                        tr_polish_btn = gr.Button("Polish with AI", variant="secondary")
 
                 with gr.Row():
                     # ── Step 2 inputs ────────────────────────────────────────
@@ -278,6 +374,16 @@ def build_ui():
                     inputs=[tr_input, tr_lang, tr_female],
                     outputs=[tr_segments, tr_duration],
                 )
+                tr_srt_btn.click(
+                    fn=load_from_srt,
+                    inputs=[tr_srt],
+                    outputs=[tr_segments, tr_duration],
+                )
+                tr_polish_btn.click(
+                    fn=run_polish_with_ai,
+                    inputs=[tr_segments, tr_lang, tr_context, tr_api_key],
+                    outputs=[tr_segments],
+                )
                 tr_step2_btn.click(
                     fn=run_step2_synthesize,
                     inputs=[tr_segments, tr_duration, tr_ref, tr_lang, tr_topk, tr_sync, tr_rate, tr_pitch],
@@ -310,7 +416,7 @@ def main():
         voice_utils.MATCH_CHUNK_FRAMES = 300
         print("Low-VRAM mode: feature chunks=5s, vocoder chunks=300 frames (~6s)")
 
-    get_model()
+    # kNN-VC is loaded only when using "Translate & Convert" with reference (saves ~9.5 GB VRAM for OpenVoice in Tab 1)
 
     demo = build_ui()
     demo.launch(server_name=args.host, server_port=args.port, share=args.share, inbrowser=True)
