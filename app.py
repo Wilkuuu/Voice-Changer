@@ -24,7 +24,6 @@ import librosa
 import torch
 
 import translate as tr
-from voice_utils import get_matching_set_chunked
 
 try:
     from openvoice_engine import is_available as openvoice_available, convert as openvoice_convert
@@ -224,31 +223,44 @@ def run_step2_synthesize(
     else:
         rate_str = f"{int(tts_rate_pct):+d}%"
         pitch_str = f"{int(tts_pitch_hz):+d}Hz"
+        use_openvoice = tts_backend == "Edge-TTS + OpenVoice" and ref_path and Path(ref_path).exists()
 
-        knn_vc = get_model()
-        device = next(knn_vc.parameters()).device
-
-        matching_set = None
-        if ref_path and Path(ref_path).exists():
-            progress(0.05, desc="Building reference voice matching set...")
-            ref_wav = load_audio_array(ref_path).to(device)
-            with torch.inference_mode():
-                matching_set = get_matching_set_chunked(knn_vc, ref_wav)
-
-        tr.synthesize_from_edited(
-            edited_text=edited_text,
-            total_duration=float(total_duration),
-            target_language=target_language,
-            output_path=out_path,
-            knn_vc=knn_vc if matching_set is not None else None,
-            matching_set=matching_set,
-            topk=int(topk),
-            sync=bool(sync),
-            tts_rate=rate_str,
-            tts_pitch=pitch_str,
-            tts_backend="edge",
-            progress_cb=log,
-        )
+        if use_openvoice:
+            # Synthesize TTS to temp file, then apply OpenVoice tone-color transfer
+            import tempfile as _tf
+            with _tf.NamedTemporaryFile(suffix=".wav", delete=False) as _tmp:
+                tts_only_path = _tmp.name
+            tr.synthesize_from_edited(
+                edited_text=edited_text,
+                total_duration=float(total_duration),
+                target_language=target_language,
+                output_path=tts_only_path,
+                sync=bool(sync),
+                tts_rate=rate_str,
+                tts_pitch=pitch_str,
+                tts_backend="edge",
+                progress_cb=log,
+            )
+            progress(0.85, desc="Applying OpenVoice tone-color transfer...")
+            openvoice_convert(
+                input_path=tts_only_path,
+                ref_path=ref_path,
+                output_path=out_path,
+                progress_cb=lambda msg, _p=None: log(msg),
+            )
+            Path(tts_only_path).unlink(missing_ok=True)
+        else:
+            tr.synthesize_from_edited(
+                edited_text=edited_text,
+                total_duration=float(total_duration),
+                target_language=target_language,
+                output_path=out_path,
+                sync=bool(sync),
+                tts_rate=rate_str,
+                tts_pitch=pitch_str,
+                tts_backend="edge",
+                progress_cb=log,
+            )
 
     out_wav, _ = librosa.load(out_path, sr=SAMPLE_RATE, mono=True)
     Path(out_path).unlink(missing_ok=True)
@@ -367,17 +379,16 @@ def build_ui():
                     with gr.Column():
                         gr.Markdown("### Step 2 — Synthesize & Convert")
                         tr_tts_backend = gr.Radio(
-                            choices=["Edge-TTS + kNN-VC", "XTTS v2"],
-                            value="XTTS v2",
+                            choices=["Edge-TTS + OpenVoice", "XTTS v2"],
+                            value="Edge-TTS + OpenVoice",
                             label="TTS Engine",
                             info=(
-                                "XTTS v2: natural voice cloning in one step — requires reference audio, "
-                                "downloads ~1.8 GB on first use. "
-                                "Edge-TTS + kNN-VC: faster, works without reference."
+                                "Edge-TTS + OpenVoice: syntetyzuje mowę, potem nakłada tembr głosu z Reference. "
+                                "XTTS v2: klonuje głos bezpośrednio przy syntezie (lepsza jakość, wolniejsze, ~1.8 GB)."
                             ),
                         )
                         tr_ref = gr.Audio(
-                            label="Reference Voice Sample (opcjonalne — XTTS klonuje z Input Audio jeśli puste)",
+                            label="Reference Voice Sample — głos do sklonowania (3–30 s)",
                             type="filepath",
                         )
                         tr_sync = gr.Checkbox(
