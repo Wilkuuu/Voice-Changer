@@ -350,11 +350,13 @@ def build_ui():
                             choices=["Chatterbox VC", "OpenVoice"],
                             value="Chatterbox VC",
                             label="Conversion Model",
-                            info=(
-                                "Chatterbox VC: resyntezuje audio przez klonowanie tembru — lepsza jakość. "
-                                "OpenVoice: szybszy transfer tonu, mniej VRAM."
-                            ),
                         )
+                        with gr.Group(visible=True) as vc_group_chatterbox:
+                            gr.Markdown(
+                                "**Chatterbox VC** — resyntezuje treść audio z głosem z nagrania "
+                                "referencyjnego przez tokenizer S3. Brak dodatkowych parametrów — "
+                                "wystarczy nagranie wejściowe i próbka głosu."
+                            )
                         with gr.Group(visible=False) as vc_group_openvoice:
                             gr.Markdown("**OpenVoice settings**")
                             vc_tau = gr.Slider(
@@ -372,12 +374,15 @@ def build_ui():
                         vc_output = gr.Audio(label="Converted Audio", type="filepath")
 
                 def _update_vc_model_ui(model):
-                    return gr.update(visible=model == "OpenVoice")
+                    return (
+                        gr.update(visible=model == "Chatterbox VC"),
+                        gr.update(visible=model == "OpenVoice"),
+                    )
 
                 vc_model_radio.change(
                     fn=_update_vc_model_ui,
                     inputs=[vc_model_radio],
-                    outputs=[vc_group_openvoice],
+                    outputs=[vc_group_chatterbox, vc_group_openvoice],
                 )
                 vc_btn.click(
                     fn=run_conversion,
@@ -577,6 +582,18 @@ def build_ui():
                     "**F5-TTS** needs 5–15 s reference + optional transcript; use `polish` model path for Polish. "
                     "**Fine-tuning F5-TTS:** `python finetune_f5tts.py --data_dir ./voice_data --base polish`"
                 )
+
+        # ── Initial state sync on page load ──────────────────────────────────
+        demo.load(
+            fn=_update_vc_model_ui,
+            inputs=[vc_model_radio],
+            outputs=[vc_group_chatterbox, vc_group_openvoice],
+        )
+        demo.load(
+            fn=_update_backend_ui,
+            inputs=[tr_tts_backend],
+            outputs=[tr_group_chatterbox, tr_group_f5tts, tr_group_xtts, tr_group_edge],
+        )
 
     return demo
 
