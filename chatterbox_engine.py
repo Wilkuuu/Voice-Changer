@@ -125,7 +125,7 @@ def synthesize(
 
 
 def unload() -> None:
-    """Free GPU memory by unloading the Chatterbox model."""
+    """Free GPU memory by unloading the Chatterbox TTS model."""
     global _model
     if _model is not None:
         try:
@@ -133,6 +133,66 @@ def unload() -> None:
             del _model
             _model = None
             torch.cuda.empty_cache()
-            print("[Chatterbox] Model unloaded.")
+            print("[Chatterbox] TTS model unloaded.")
         except Exception:
             _model = None
+
+
+# ── Voice Conversion (Chatterbox VC) ─────────────────────────────────────────
+
+_vc_model = None
+
+
+def is_vc_available() -> bool:
+    try:
+        from chatterbox.vc import ChatterboxVC  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+def get_vc_model():
+    global _vc_model, _device
+    if _vc_model is None:
+        import torch
+        if _device is None:
+            _device = "cuda" if torch.cuda.is_available() else "cpu"
+        print(f"[Chatterbox VC] Loading voice conversion model on {_device}...")
+        from chatterbox.vc import ChatterboxVC
+        _vc_model = ChatterboxVC.from_pretrained(device=_device)
+        print("[Chatterbox VC] Model loaded.")
+    return _vc_model
+
+
+def convert_voice(
+    input_path: str,
+    ref_path: str,
+    output_path: str,
+) -> None:
+    """
+    Convert the voice in input_path to match the speaker in ref_path.
+
+    Args:
+        input_path  : source audio (content to preserve)
+        ref_path    : reference speaker audio (voice identity to apply)
+        output_path : output .wav path
+    """
+    import torchaudio as ta
+
+    model = get_vc_model()
+    wav = model.generate(audio=input_path, target_voice_path=ref_path)
+    ta.save(output_path, wav, model.sr)
+
+
+def unload_vc() -> None:
+    """Free GPU memory by unloading the Chatterbox VC model."""
+    global _vc_model
+    if _vc_model is not None:
+        try:
+            import torch
+            del _vc_model
+            _vc_model = None
+            torch.cuda.empty_cache()
+            print("[Chatterbox VC] Model unloaded.")
+        except Exception:
+            _vc_model = None

@@ -69,21 +69,14 @@ def load_audio_array(path: str) -> torch.Tensor:
     return torch.from_numpy(wav).unsqueeze(0)  # (1, T)
 
 
-def run_conversion(input_audio, reference_audio, tau, temperature, progress=gr.Progress()):
-    """Tab 1: Voice conversion using OpenVoice (natural tone-color transfer)."""
+def run_conversion(input_audio, reference_audio, vc_model, tau, temperature, progress=gr.Progress()):
+    """Tab 1: Voice conversion — Chatterbox VC or OpenVoice."""
     input_path = _audio_path(input_audio)
     ref_path = _audio_path(reference_audio)
     if not input_path or not Path(input_path).exists():
         raise gr.Error("Please upload an input audio file.")
     if not ref_path or not Path(ref_path).exists():
         raise gr.Error("Please upload a reference voice sample.")
-
-    if not openvoice_available():
-        raise gr.Error(
-            "OpenVoice is not installed. Install it for natural voice cloning:\n"
-            "  pip install openvoice-cli\n"
-            "For GPU: pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu118"
-        )
 
     def log_progress(msg: str, p: float | None = None) -> None:
         print(f"[Voice Conversion] {msg}", flush=True)
@@ -92,24 +85,54 @@ def run_conversion(input_audio, reference_audio, tau, temperature, progress=gr.P
         else:
             progress(None, desc=msg)
 
-    log_progress("Starting OpenVoice conversion (chunked to reduce VRAM)...", 0.0)
-    try:
-        out_path = openvoice_convert(
-            input_path=input_path,
-            ref_path=ref_path,
-            output_path=None,
-            device=None,
-            tau=float(tau),
-            temperature=float(temperature),
-            chunk_duration_sec=18,
-            progress_cb=log_progress,
-            use_cpu_fallback_on_oom=True,
-        )
-    except Exception as e:
-        print(f"[Voice Conversion] ERROR: {e}", flush=True)
-        raise gr.Error(f"Voice conversion failed: {e}") from e
-    log_progress("Done.", 1.0)
-    return out_path
+    if vc_model == "Chatterbox VC":
+        try:
+            import chatterbox_engine
+            if not chatterbox_engine.is_vc_available():
+                raise gr.Error("Chatterbox VC not available. Run: pip install chatterbox-tts")
+        except ImportError:
+            raise gr.Error("Chatterbox not installed. Run: pip install chatterbox-tts")
+
+        log_progress("Loading Chatterbox VC model (first run downloads weights)...", 0.0)
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+            out_path = tmp.name
+        try:
+            chatterbox_engine.convert_voice(
+                input_path=input_path,
+                ref_path=ref_path,
+                output_path=out_path,
+            )
+        except Exception as e:
+            Path(out_path).unlink(missing_ok=True)
+            print(f"[Voice Conversion] ERROR: {e}", flush=True)
+            raise gr.Error(f"Chatterbox VC failed: {e}") from e
+        log_progress("Done.", 1.0)
+        return out_path
+
+    else:  # OpenVoice
+        if not openvoice_available():
+            raise gr.Error(
+                "OpenVoice is not installed.\n"
+                "  pip install openvoice-cli"
+            )
+        log_progress("Starting OpenVoice conversion (chunked to reduce VRAM)...", 0.0)
+        try:
+            out_path = openvoice_convert(
+                input_path=input_path,
+                ref_path=ref_path,
+                output_path=None,
+                device=None,
+                tau=float(tau),
+                temperature=float(temperature),
+                chunk_duration_sec=18,
+                progress_cb=log_progress,
+                use_cpu_fallback_on_oom=True,
+            )
+        except Exception as e:
+            print(f"[Voice Conversion] ERROR: {e}", flush=True)
+            raise gr.Error(f"OpenVoice conversion failed: {e}") from e
+        log_progress("Done.", 1.0)
+        return out_path
 
 
 def load_from_srt(srt_file):
@@ -313,8 +336,9 @@ def build_ui():
             # ── Tab 1: Voice Conversion ──────────────────────────────────────
             with gr.Tab("Voice Conversion"):
                 gr.Markdown(
-                    "Convert voice in input audio to match a reference speaker using **OpenVoice** "
-                    "(tone-color transfer). Natural cloning, no training, GPU-accelerated."
+                    "Convert voice in input audio to match a reference speaker. "
+                    "Choose between **Chatterbox VC** (higher quality, S3 token resynthesis) "
+                    "or **OpenVoice** (tone-color transfer, faster)."
                 )
                 with gr.Row():
                     with gr.Column():
@@ -322,34 +346,48 @@ def build_ui():
                         vc_ref = gr.Audio(
                             label="Reference Voice Sample (5–30 s)", type="filepath"
                         )
-                        vc_tau = gr.Slider(
-                            minimum=0.3,
-                            maximum=1.0,
-                            value=0.65,
-                            step=0.05,
-                            label="Reference voice strength (tau)",
-                            info="Higher = output closer to reference.",
+                        vc_model_radio = gr.Radio(
+                            choices=["Chatterbox VC", "OpenVoice"],
+                            value="Chatterbox VC",
+                            label="Conversion Model",
+                            info=(
+                                "Chatterbox VC: resyntezuje audio przez klonowanie tembru — lepsza jakość. "
+                                "OpenVoice: szybszy transfer tonu, mniej VRAM."
+                            ),
                         )
-                        vc_temperature = gr.Slider(
-                            minimum=0.7,
-                            maximum=1.3,
-                            value=1.0,
-                            step=0.05,
-                            label="Voice temperature",
-                            info="Higher = warmer, more expressive; lower = calmer, more even.",
-                        )
+                        with gr.Group(visible=False) as vc_group_openvoice:
+                            gr.Markdown("**OpenVoice settings**")
+                            vc_tau = gr.Slider(
+                                minimum=0.3, maximum=1.0, value=0.65, step=0.05,
+                                label="Reference voice strength (tau)",
+                                info="Higher = output closer to reference.",
+                            )
+                            vc_temperature = gr.Slider(
+                                minimum=0.7, maximum=1.3, value=1.0, step=0.05,
+                                label="Voice temperature",
+                                info="Higher = warmer, more expressive; lower = calmer.",
+                            )
                         vc_btn = gr.Button("Convert Voice", variant="primary")
                     with gr.Column():
                         vc_output = gr.Audio(label="Converted Audio", type="filepath")
 
+                def _update_vc_model_ui(model):
+                    return gr.update(visible=model == "OpenVoice")
+
+                vc_model_radio.change(
+                    fn=_update_vc_model_ui,
+                    inputs=[vc_model_radio],
+                    outputs=[vc_group_openvoice],
+                )
                 vc_btn.click(
                     fn=run_conversion,
-                    inputs=[vc_input, vc_ref, vc_tau, vc_temperature],
+                    inputs=[vc_input, vc_ref, vc_model_radio, vc_tau, vc_temperature],
                     outputs=[vc_output],
                 )
                 gr.Markdown(
                     "**Tips:** Use 5–30 s of clean reference speech (one speaker, little noise). "
-                    "Requires: `pip install openvoice-cli` (and CUDA PyTorch for GPU)."
+                    "Chatterbox VC downloads weights on first use (~500 MB). "
+                    "OpenVoice requires: `pip install openvoice-cli`."
                 )
 
             # ── Tab 2: Translate & Convert ───────────────────────────────────
@@ -400,7 +438,7 @@ def build_ui():
                         gr.Markdown("### AI Segment Polishing (optional)")
                         tr_context = gr.Textbox(
                             label="Narrative context / style hint",
-                            placeholder="e.g. Erotic monologue of a girl speaking to a male listener. Polish language.",
+                            placeholder="e.g. Monologue of narrator to listener. English language.",
                             lines=2,
                         )
                         tr_api_key = gr.Textbox(
