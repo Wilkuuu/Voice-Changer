@@ -583,17 +583,7 @@ def build_ui():
                     "**Fine-tuning F5-TTS:** `python finetune_f5tts.py --data_dir ./voice_data --base polish`"
                 )
 
-        # ── Initial state sync on page load ──────────────────────────────────
-        demo.load(
-            fn=_update_vc_model_ui,
-            inputs=[vc_model_radio],
-            outputs=[vc_group_chatterbox, vc_group_openvoice],
-        )
-        demo.load(
-            fn=_update_backend_ui,
-            inputs=[tr_tts_backend],
-            outputs=[tr_group_chatterbox, tr_group_f5tts, tr_group_xtts, tr_group_edge],
-        )
+
 
     return demo
 
