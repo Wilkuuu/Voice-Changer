@@ -113,32 +113,20 @@ def run_conversion(
         import chatterbox_engine
         if not chatterbox_engine.is_available():
             raise gr.Error("Chatterbox not available. Run: pip install chatterbox-tts")
-        log_progress("Transcribing input audio with Whisper...", 0.1)
-        # Transcribe input to get the text
-        segments_text, _ = tr.transcribe_and_translate(
+        log_progress("Transcribing input audio (original language)...", 0.1)
+        full_text, lang_code, _ = tr.transcribe_only(
             audio_path=input_path,
-            target_language="English",
-            female_narrator=False,
             progress_cb=lambda msg: log_progress(msg),
         )
-        # Extract plain text from segments
-        lines = []
-        for line in segments_text.strip().splitlines():
-            line = line.strip()
-            if line.startswith("[") and "]" in line:
-                text_part = line.split("]", 1)[1].strip()
-                if text_part:
-                    lines.append(text_part)
-        full_text = " ".join(lines)
         if not full_text:
             raise gr.Error("Could not extract text from input audio.")
-        log_progress("Synthesizing with Chatterbox TTS...", 0.5)
+        log_progress(f"Synthesizing with Chatterbox TTS (lang={lang_code})...", 0.5)
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
             out_path = tmp.name
         try:
             chatterbox_engine.synthesize(
                 text=full_text,
-                language="en",
+                language=lang_code,
                 ref_audio_path=ref_path,
                 output_path=out_path,
                 exaggeration=float(cb_exaggeration),

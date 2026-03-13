@@ -431,6 +431,53 @@ def transcribe_and_translate(
     return "\n".join(lines), info.duration
 
 
+# Common Whisper hallucinations to filter out
+_WHISPER_HALLUCINATIONS = {
+    "this is the end of the video",
+    "thank you for watching",
+    "please subscribe",
+    "like and subscribe",
+    "subtitles by",
+    "transcribed by",
+    "[music]",
+    "[applause]",
+    "[silence]",
+}
+
+
+def transcribe_only(
+    audio_path: str,
+    progress_cb=None,
+) -> tuple[str, str, float]:
+    """
+    Transcribe audio in its original language without translation.
+
+    Returns (plain_text, detected_language_code, duration).
+    Filters common Whisper hallucinations.
+    """
+    def step(msg: str):
+        print(msg)
+        if progress_cb:
+            progress_cb(msg)
+
+    step("Transcribing (Whisper, original language)...")
+    whisper = get_whisper()
+    segments_gen, info = whisper.transcribe(audio_path, task="transcribe", beam_size=5)
+    segments = list(segments_gen)
+    step(f"Detected [{info.language}], {info.duration:.1f}s, {len(segments)} segments")
+
+    parts: list[str] = []
+    for seg in segments:
+        text = seg.text.strip()
+        if not text:
+            continue
+        if text.lower().rstrip(".!?,") in _WHISPER_HALLUCINATIONS:
+            continue
+        parts.append(text)
+
+    return " ".join(parts), info.language, info.duration
+
+
 def parse_srt(srt_content: str) -> tuple[str, float]:
     """Parse SRT file content into the segments format used by the app.
 
