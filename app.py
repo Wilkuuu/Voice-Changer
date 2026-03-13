@@ -170,13 +170,13 @@ def run_step1_transcribe(
         progress_cb=log,
     )
     progress(1.0, desc="Done. Edit segments below, then click Synthesize.")
-    return segments_text, total_duration
+    return segments_text, total_duration, input_path
 
 
 def run_step2_synthesize(
     edited_text, total_duration, reference_audio, target_language,
     topk, sync, tts_rate_pct, tts_pitch_hz,
-    tts_backend, xtts_speed,
+    tts_backend, xtts_speed, input_audio_path,
     progress=gr.Progress(),
 ):
     """Tab 2 Step 2: TTS + optional voice conversion from edited segments."""
@@ -185,11 +185,19 @@ def run_step2_synthesize(
     if total_duration == 0:
         raise gr.Error("Missing audio duration. Run Step 1 first.")
 
+    # For XTTS: explicit reference overrides, otherwise fall back to input audio
     ref_path = _audio_path(reference_audio) if reference_audio else None
     use_xtts = tts_backend == "XTTS v2"
 
-    if use_xtts and (not ref_path or not Path(ref_path).exists()):
-        raise gr.Error("XTTS v2 requires a Reference Voice Sample for voice cloning.")
+    if use_xtts:
+        if not ref_path or not Path(ref_path).exists():
+            # Auto-use the input audio as voice reference (clone original speaker)
+            ref_path = input_audio_path if input_audio_path and Path(str(input_audio_path)).exists() else None
+        if not ref_path:
+            raise gr.Error(
+                "XTTS v2 requires audio to clone the voice from. "
+                "Upload input audio in Step 1, or upload a separate Reference Voice Sample."
+            )
 
     step_count = [0]
 
@@ -304,8 +312,9 @@ def build_ui():
                     "**Step 1:** Transcribe & translate → review/edit segments → "
                     "**Step 2:** Synthesize & convert"
                 )
-                # Shared state: total audio duration returned by step 1
+                # Shared state: total audio duration + input audio path (for XTTS auto-reference)
                 tr_duration = gr.State(0.0)
+                tr_input_state = gr.State(None)  # stores input audio path after step 1
 
                 with gr.Row():
                     # ── Step 1 inputs ────────────────────────────────────────
@@ -368,7 +377,7 @@ def build_ui():
                             ),
                         )
                         tr_ref = gr.Audio(
-                            label="Reference Voice Sample (3–30 s, required for XTTS / optional for kNN-VC)",
+                            label="Reference Voice Sample (opcjonalne — XTTS klonuje z Input Audio jeśli puste)",
                             type="filepath",
                         )
                         tr_sync = gr.Checkbox(
@@ -407,7 +416,7 @@ def build_ui():
                 tr_step1_btn.click(
                     fn=run_step1_transcribe,
                     inputs=[tr_input, tr_lang, tr_female],
-                    outputs=[tr_segments, tr_duration],
+                    outputs=[tr_segments, tr_duration, tr_input_state],
                 )
                 tr_srt_btn.click(
                     fn=load_from_srt,
@@ -424,7 +433,7 @@ def build_ui():
                     inputs=[
                         tr_segments, tr_duration, tr_ref, tr_lang,
                         tr_topk, tr_sync, tr_rate, tr_pitch,
-                        tr_tts_backend, tr_xtts_speed,
+                        tr_tts_backend, tr_xtts_speed, tr_input_state,
                     ],
                     outputs=[tr_output],
                 )
