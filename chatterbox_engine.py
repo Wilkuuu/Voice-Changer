@@ -18,6 +18,36 @@ from __future__ import annotations
 _model = None
 _device: str | None = None
 
+
+def _patch_transformers_sdpa() -> None:
+    """
+    Patch transformers 5.x compatibility issue with Chatterbox.
+
+    Chatterbox's AlignmentStreamAnalyzer sets output_attentions=True on a
+    transformer config, but transformers 5.x raises ValueError when the model
+    uses attn_implementation='sdpa'. Fix: switch to 'eager' before setting it.
+    """
+    try:
+        from chatterbox.models.t3.inference.alignment_stream_analyzer import (
+            AlignmentStreamAnalyzer,
+        )
+
+        if getattr(AlignmentStreamAnalyzer, "_sdpa_patched", False):
+            return
+
+        _orig_spy = AlignmentStreamAnalyzer._add_attention_spy
+
+        def _patched_spy(self, tfmr, i, layer_idx, head_idx):
+            cfg = getattr(tfmr, "config", None)
+            if cfg is not None and getattr(cfg, "_attn_implementation", None) == "sdpa":
+                cfg._attn_implementation = "eager"
+            _orig_spy(self, tfmr, i, layer_idx, head_idx)
+
+        AlignmentStreamAnalyzer._add_attention_spy = _patched_spy
+        AlignmentStreamAnalyzer._sdpa_patched = True
+    except Exception:
+        pass  # patch is best-effort; if it fails the original error will surface
+
 SUPPORTED_LANGUAGES = {
     "pl", "en", "de", "fr", "es", "it", "ru", "pt", "nl",
     "tr", "ar", "zh", "ja", "ko", "uk", "cs", "hu",
@@ -41,6 +71,7 @@ def get_model():
     global _model, _device
     if _model is None:
         import torch
+        _patch_transformers_sdpa()
         _device = "cuda" if torch.cuda.is_available() else "cpu"
         try:
             from chatterbox.mtl_tts import ChatterboxMultilingualTTS
