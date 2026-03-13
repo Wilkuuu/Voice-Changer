@@ -553,21 +553,26 @@ def synthesize_from_edited(
     sync: bool = True,
     tts_rate: str = "+0%",
     tts_pitch: str = "+0Hz",
-    tts_backend: str = "edge",   # "edge" or "xtts"
+    tts_backend: str = "edge",   # "edge" | "xtts" | "chatterbox" | "f5tts"
     xtts_ref_path: str | None = None,
     xtts_speed: float = 1.0,
+    chatterbox_exaggeration: float = 0.5,
+    chatterbox_cfg_weight: float = 0.5,
+    f5tts_ref_text: str = "",
+    f5tts_model_path: str | None = None,
+    f5tts_speed: float = 1.0,
     progress_cb=None,
 ) -> None:
     """
     Step 2 of the two-step interactive pipeline.
 
     Parses the user-edited segment text (format: "[start - end] text per line"),
-    synthesizes TTS for each segment, fits it to the original timing, then
-    optionally applies kNN-VC voice conversion.
+    synthesizes TTS for each segment, fits it to the original timing.
 
-    tts_backend="xtts": uses XTTS v2 with built-in voice cloning (xtts_ref_path required).
-                        Skips kNN-VC — voice cloning is done inside TTS.
-    tts_backend="edge": uses edge-tts, then optionally kNN-VC voice conversion.
+    tts_backend="edge"        : edge-tts + optional kNN-VC
+    tts_backend="xtts"        : XTTS v2 zero-shot voice cloning (~1.8 GB, Polish native)
+    tts_backend="chatterbox"  : Chatterbox Multilingual — beats ElevenLabs, MIT license
+    tts_backend="f5tts"       : F5-TTS flow-matching — best naturalness, fine-tunable
     """
     def step(msg: str):
         print(msg)
@@ -579,17 +584,46 @@ def synthesize_from_edited(
         raise ValueError("No segments found in edited text. Expected format: [start - end] Text...")
 
     lang_code = LANGUAGES[target_language]["lang_code"]
-    use_xtts = tts_backend == "xtts" and xtts_ref_path and Path(xtts_ref_path).exists()
 
-    if use_xtts:
+    # Resolve which backend to use, with graceful fallback
+    backend = tts_backend.lower()
+    ref_path = xtts_ref_path  # shared reference audio for all cloning backends
+
+    if backend == "xtts":
         try:
             import xtts_engine
-            if not xtts_engine.is_available():
-                step("XTTS not installed — falling back to edge-tts")
-                use_xtts = False
+            if not xtts_engine.is_available() or not ref_path or not Path(ref_path).exists():
+                step("XTTS unavailable/no ref — falling back to edge-tts")
+                backend = "edge"
         except ImportError:
             step("XTTS not installed — falling back to edge-tts")
-            use_xtts = False
+            backend = "edge"
+
+    elif backend == "chatterbox":
+        try:
+            import chatterbox_engine
+            if not chatterbox_engine.is_available():
+                step("Chatterbox not installed — falling back to edge-tts")
+                backend = "edge"
+            elif not ref_path or not Path(ref_path).exists():
+                step("Chatterbox requires a reference audio — falling back to edge-tts")
+                backend = "edge"
+        except ImportError:
+            step("Chatterbox not installed — falling back to edge-tts")
+            backend = "edge"
+
+    elif backend == "f5tts":
+        try:
+            import f5tts_engine
+            if not f5tts_engine.is_available():
+                step("F5-TTS not installed — falling back to edge-tts")
+                backend = "edge"
+            elif not ref_path or not Path(ref_path).exists():
+                step("F5-TTS requires a reference audio — falling back to edge-tts")
+                backend = "edge"
+        except ImportError:
+            step("F5-TTS not installed — falling back to edge-tts")
+            backend = "edge"
 
     voice = LANGUAGES[target_language]["tts_voice"]
     total_samples = int(total_duration * SAMPLE_RATE)
@@ -606,17 +640,42 @@ def synthesize_from_edited(
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
             tts_path = f.name
 
-        if use_xtts:
+        if backend == "xtts":
             step(f"XTTS {i+1}/{n}: {text[:70]}")
             import xtts_engine
             xtts_engine.synthesize(
                 text=text,
                 language=lang_code,
-                ref_audio_path=xtts_ref_path,
+                ref_audio_path=ref_path,
                 output_path=tts_path,
                 speed=xtts_speed,
             )
-        else:
+
+        elif backend == "chatterbox":
+            step(f"Chatterbox {i+1}/{n}: {text[:70]}")
+            import chatterbox_engine
+            chatterbox_engine.synthesize(
+                text=text,
+                language=lang_code,
+                ref_audio_path=ref_path,
+                output_path=tts_path,
+                exaggeration=chatterbox_exaggeration,
+                cfg_weight=chatterbox_cfg_weight,
+            )
+
+        elif backend == "f5tts":
+            step(f"F5-TTS {i+1}/{n}: {text[:70]}")
+            import f5tts_engine
+            f5tts_engine.synthesize(
+                text=text,
+                ref_audio_path=ref_path,
+                output_path=tts_path,
+                ref_text=f5tts_ref_text,
+                model_path=f5tts_model_path if f5tts_model_path else None,
+                speed=f5tts_speed,
+            )
+
+        else:  # edge-tts
             step(f"TTS {i+1}/{n}: {text[:70]}")
             Path(tts_path).unlink(missing_ok=True)
             with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
@@ -640,8 +699,8 @@ def synthesize_from_edited(
             out = np.pad(out, (0, end_idx - len(out)))
         out[seg_start:end_idx] += tts_warped
 
-    # Voice conversion — only for edge-tts backend (XTTS has built-in voice cloning)
-    if not use_xtts and knn_vc is not None and matching_set is not None:
+    # Voice conversion — only for edge-tts backend (others have built-in voice cloning)
+    if backend == "edge" and knn_vc is not None and matching_set is not None:
         step("Applying voice conversion...")
         from voice_utils import extract_features_chunked, match_chunked
         tensor = torch.from_numpy(out).unsqueeze(0).to(next(knn_vc.parameters()).device)

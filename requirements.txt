@@ -19,3 +19,12 @@ anthropic>=0.20.0
 
 # High-quality TTS with voice cloning (XTTS v2) — Python 3.12 compatible fork
 coqui-tts>=0.24.0
+
+# Chatterbox Multilingual TTS — beats ElevenLabs, native Polish, MIT license
+# pip install chatterbox-tts
+chatterbox-tts
+
+# F5-TTS — flow-matching TTS, best naturalness, fine-tunable for custom voices
+# Polish community checkpoint: huggingface.co/Gregniuki/F5-tts_English_German_Polish
+# pip install f5-tts
+f5-tts

@@ -175,7 +175,10 @@ def run_step1_transcribe(
 def run_step2_synthesize(
     edited_text, total_duration, reference_audio, target_language,
     topk, sync, tts_rate_pct, tts_pitch_hz,
-    tts_backend, xtts_speed, input_audio_path,
+    tts_backend, xtts_speed,
+    chatterbox_exaggeration, chatterbox_cfg_weight,
+    f5tts_ref_text, f5tts_model_path, f5tts_speed,
+    input_audio_path,
     progress=gr.Progress(),
 ):
     """Tab 2 Step 2: TTS + optional voice conversion from edited segments."""
@@ -184,17 +187,15 @@ def run_step2_synthesize(
     if total_duration == 0:
         raise gr.Error("Missing audio duration. Run Step 1 first.")
 
-    # For XTTS: explicit reference overrides, otherwise fall back to input audio
     ref_path = _audio_path(reference_audio) if reference_audio else None
-    use_xtts = tts_backend == "XTTS v2"
 
-    if use_xtts:
-        if not ref_path or not Path(ref_path).exists():
-            # Auto-use the input audio as voice reference (clone original speaker)
-            ref_path = input_audio_path if input_audio_path and Path(str(input_audio_path)).exists() else None
+    # Backends that need a reference voice — auto-fallback to input audio
+    needs_ref = tts_backend in ("XTTS v2", "Chatterbox", "F5-TTS")
+    if needs_ref and (not ref_path or not Path(ref_path).exists()):
+        ref_path = input_audio_path if input_audio_path and Path(str(input_audio_path)).exists() else None
         if not ref_path:
             raise gr.Error(
-                "XTTS v2 requires audio to clone the voice from. "
+                f"{tts_backend} requires a reference voice audio. "
                 "Upload input audio in Step 1, or upload a separate Reference Voice Sample."
             )
 
@@ -207,7 +208,7 @@ def run_step2_synthesize(
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
         out_path = tmp.name
 
-    if use_xtts:
+    if tts_backend == "XTTS v2":
         progress(0.05, desc="Loading XTTS v2 model (first run: downloads ~1.8 GB)...")
         tr.synthesize_from_edited(
             edited_text=edited_text,
@@ -220,13 +221,48 @@ def run_step2_synthesize(
             xtts_speed=float(xtts_speed),
             progress_cb=log,
         )
+
+    elif tts_backend == "Chatterbox":
+        progress(0.05, desc="Loading Chatterbox model (first run: downloads ~1.5 GB)...")
+        tr.synthesize_from_edited(
+            edited_text=edited_text,
+            total_duration=float(total_duration),
+            target_language=target_language,
+            output_path=out_path,
+            sync=bool(sync),
+            tts_backend="chatterbox",
+            xtts_ref_path=ref_path,
+            chatterbox_exaggeration=float(chatterbox_exaggeration),
+            chatterbox_cfg_weight=float(chatterbox_cfg_weight),
+            progress_cb=log,
+        )
+
+    elif tts_backend == "F5-TTS":
+        model_path = f5tts_model_path.strip() if f5tts_model_path else None
+        if model_path == "":
+            model_path = None
+        progress(0.05, desc="Loading F5-TTS model...")
+        tr.synthesize_from_edited(
+            edited_text=edited_text,
+            total_duration=float(total_duration),
+            target_language=target_language,
+            output_path=out_path,
+            sync=bool(sync),
+            tts_backend="f5tts",
+            xtts_ref_path=ref_path,
+            f5tts_ref_text=f5tts_ref_text or "",
+            f5tts_model_path=model_path,
+            f5tts_speed=float(f5tts_speed),
+            progress_cb=log,
+        )
+
     else:
+        # Edge-TTS (with optional OpenVoice)
         rate_str = f"{int(tts_rate_pct):+d}%"
         pitch_str = f"{int(tts_pitch_hz):+d}Hz"
         use_openvoice = tts_backend == "Edge-TTS + OpenVoice" and ref_path and Path(ref_path).exists()
 
         if use_openvoice:
-            # Synthesize TTS to temp file, then apply OpenVoice tone-color transfer
             import tempfile as _tf
             with _tf.NamedTemporaryFile(suffix=".wav", delete=False) as _tmp:
                 tts_only_path = _tmp.name
@@ -379,16 +415,18 @@ def build_ui():
                     with gr.Column():
                         gr.Markdown("### Step 2 — Synthesize & Convert")
                         tr_tts_backend = gr.Radio(
-                            choices=["Edge-TTS + OpenVoice", "XTTS v2"],
-                            value="Edge-TTS + OpenVoice",
+                            choices=["Edge-TTS + OpenVoice", "XTTS v2", "Chatterbox", "F5-TTS"],
+                            value="Chatterbox",
                             label="TTS Engine",
                             info=(
-                                "Edge-TTS + OpenVoice: syntetyzuje mowę, potem nakłada tembr głosu z Reference. "
-                                "XTTS v2: klonuje głos bezpośrednio przy syntezie (lepsza jakość, wolniejsze, ~1.8 GB)."
+                                "Chatterbox: najlepsza jakość, natywny polski, MIT. "
+                                "F5-TTS: flow-matching, fine-tunable, wspólnotowy model PL. "
+                                "XTTS v2: zero-shot klonowanie głosu. "
+                                "Edge-TTS + OpenVoice: lekka opcja online."
                             ),
                         )
                         tr_ref = gr.Audio(
-                            label="Reference Voice Sample — głos do sklonowania (3–30 s)",
+                            label="Reference Voice Sample — głos do sklonowania (10–30 s)",
                             type="filepath",
                         )
                         tr_sync = gr.Checkbox(
@@ -397,15 +435,44 @@ def build_ui():
                             info="Adjust silence gaps to match source segment duration (speech is never stretched)",
                         )
                         with gr.Group():
+                            gr.Markdown("**Chatterbox settings**")
+                            tr_cb_exaggeration = gr.Slider(
+                                minimum=0.0, maximum=1.0, value=0.5, step=0.05,
+                                label="Emotion exaggeration",
+                                info="Higher = more expressive/dramatic speech.",
+                            )
+                            tr_cb_cfg = gr.Slider(
+                                minimum=0.0, maximum=1.0, value=0.5, step=0.05,
+                                label="CFG weight (guidance)",
+                                info="Higher = more faithful to reference voice.",
+                            )
+                        with gr.Group():
+                            gr.Markdown("**F5-TTS settings**")
+                            tr_f5_ref_text = gr.Textbox(
+                                label="Reference audio transcript (F5-TTS)",
+                                placeholder="Wpisz transkrypt nagrania referencyjnego dla lepszej jakości...",
+                                lines=2,
+                                info="Transcript of the reference voice audio. Leave empty to auto-detect.",
+                            )
+                            tr_f5_model_path = gr.Textbox(
+                                label="F5-TTS model path (optional)",
+                                placeholder='Puste = model bazowy. Wpisz "polish" dla modelu PL lub ścieżkę do .pt',
+                                info='Use "polish" to auto-download the Polish community checkpoint (~3 GB).',
+                            )
+                            tr_f5_speed = gr.Slider(
+                                minimum=0.5, maximum=2.0, value=1.0, step=0.05,
+                                label="F5-TTS Speaking Speed",
+                            )
+                        with gr.Group():
+                            gr.Markdown("**XTTS v2 / Edge-TTS settings**")
                             tr_xtts_speed = gr.Slider(
                                 minimum=0.5, maximum=2.0, value=1.0, step=0.05,
                                 label="XTTS Speaking Speed",
-                                info="Only for XTTS v2. 1.0 = normal speed.",
+                                info="Only for XTTS v2.",
                             )
                             tr_topk = gr.Slider(
                                 minimum=1, maximum=16, value=4, step=1,
                                 label="Top-K Neighbors (Edge-TTS + kNN-VC only)",
-                                info="Higher = smoother, lower = more expressive",
                             )
                             tr_rate = gr.Slider(
                                 minimum=-30, maximum=30, value=0, step=1,
@@ -444,14 +511,18 @@ def build_ui():
                     inputs=[
                         tr_segments, tr_duration, tr_ref, tr_lang,
                         tr_topk, tr_sync, tr_rate, tr_pitch,
-                        tr_tts_backend, tr_xtts_speed, tr_input_state,
+                        tr_tts_backend, tr_xtts_speed,
+                        tr_cb_exaggeration, tr_cb_cfg,
+                        tr_f5_ref_text, tr_f5_model_path, tr_f5_speed,
+                        tr_input_state,
                     ],
                     outputs=[tr_output],
                 )
                 gr.Markdown(
                     "**Tips:** "
-                    "XTTS v2 needs 3–30 s of clean reference speech and ~4 GB VRAM (CPU fallback available, slow). "
-                    "First use downloads Whisper (~150 MB), translation packages (~80 MB), and XTTS v2 (~1.8 GB)."
+                    "**Chatterbox** needs 10–30 s of reference audio, downloads ~1.5 GB on first use. "
+                    "**F5-TTS** needs 5–15 s reference + optional transcript; use `polish` model path for Polish. "
+                    "**Fine-tuning F5-TTS:** `python finetune_f5tts.py --data_dir ./voice_data --base polish`"
                 )
 
     return demo
