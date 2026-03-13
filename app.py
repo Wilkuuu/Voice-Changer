@@ -21,12 +21,10 @@ os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import gradio as gr
 import librosa
-import numpy as np
-import soundfile as sf
 import torch
 
 import translate as tr
-from voice_utils import extract_features_chunked, get_matching_set_chunked, match_chunked
+from voice_utils import get_matching_set_chunked
 
 try:
     from openvoice_engine import is_available as openvoice_available, convert as openvoice_convert
@@ -178,6 +176,7 @@ def run_step1_transcribe(
 def run_step2_synthesize(
     edited_text, total_duration, reference_audio, target_language,
     topk, sync, tts_rate_pct, tts_pitch_hz,
+    tts_backend, xtts_speed,
     progress=gr.Progress(),
 ):
     """Tab 2 Step 2: TTS + optional voice conversion from edited segments."""
@@ -186,42 +185,62 @@ def run_step2_synthesize(
     if total_duration == 0:
         raise gr.Error("Missing audio duration. Run Step 1 first.")
 
-    rate_str = f"{int(tts_rate_pct):+d}%"
-    pitch_str = f"{int(tts_pitch_hz):+d}Hz"
-
-    knn_vc = get_model()
-    device = next(knn_vc.parameters()).device
-
-    matching_set = None
     ref_path = _audio_path(reference_audio) if reference_audio else None
-    if ref_path and Path(ref_path).exists():
-        progress(0.05, desc="Building reference voice matching set...")
-        ref_wav = load_audio_array(ref_path).to(device)
-        with torch.inference_mode():
-            matching_set = get_matching_set_chunked(knn_vc, ref_wav)
+    use_xtts = tts_backend == "XTTS v2"
+
+    if use_xtts and (not ref_path or not Path(ref_path).exists()):
+        raise gr.Error("XTTS v2 requires a Reference Voice Sample for voice cloning.")
 
     step_count = [0]
 
     def log(msg: str):
         step_count[0] += 1
-        progress(min(0.1 + step_count[0] * 0.10, 0.90), desc=msg)
+        progress(min(0.1 + step_count[0] * 0.07, 0.92), desc=msg)
 
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
         out_path = tmp.name
 
-    tr.synthesize_from_edited(
-        edited_text=edited_text,
-        total_duration=float(total_duration),
-        target_language=target_language,
-        output_path=out_path,
-        knn_vc=knn_vc if matching_set is not None else None,
-        matching_set=matching_set,
-        topk=int(topk),
-        sync=bool(sync),
-        tts_rate=rate_str,
-        tts_pitch=pitch_str,
-        progress_cb=log,
-    )
+    if use_xtts:
+        progress(0.05, desc="Loading XTTS v2 model (first run: downloads ~1.8 GB)...")
+        tr.synthesize_from_edited(
+            edited_text=edited_text,
+            total_duration=float(total_duration),
+            target_language=target_language,
+            output_path=out_path,
+            sync=bool(sync),
+            tts_backend="xtts",
+            xtts_ref_path=ref_path,
+            xtts_speed=float(xtts_speed),
+            progress_cb=log,
+        )
+    else:
+        rate_str = f"{int(tts_rate_pct):+d}%"
+        pitch_str = f"{int(tts_pitch_hz):+d}Hz"
+
+        knn_vc = get_model()
+        device = next(knn_vc.parameters()).device
+
+        matching_set = None
+        if ref_path and Path(ref_path).exists():
+            progress(0.05, desc="Building reference voice matching set...")
+            ref_wav = load_audio_array(ref_path).to(device)
+            with torch.inference_mode():
+                matching_set = get_matching_set_chunked(knn_vc, ref_wav)
+
+        tr.synthesize_from_edited(
+            edited_text=edited_text,
+            total_duration=float(total_duration),
+            target_language=target_language,
+            output_path=out_path,
+            knn_vc=knn_vc if matching_set is not None else None,
+            matching_set=matching_set,
+            topk=int(topk),
+            sync=bool(sync),
+            tts_rate=rate_str,
+            tts_pitch=pitch_str,
+            tts_backend="edge",
+            progress_cb=log,
+        )
 
     out_wav, _ = librosa.load(out_path, sr=SAMPLE_RATE, mono=True)
     Path(out_path).unlink(missing_ok=True)
@@ -338,8 +357,18 @@ def build_ui():
                     # ── Step 2 inputs ────────────────────────────────────────
                     with gr.Column():
                         gr.Markdown("### Step 2 — Synthesize & Convert")
+                        tr_tts_backend = gr.Radio(
+                            choices=["Edge-TTS + kNN-VC", "XTTS v2"],
+                            value="XTTS v2",
+                            label="TTS Engine",
+                            info=(
+                                "XTTS v2: natural voice cloning in one step — requires reference audio, "
+                                "downloads ~1.8 GB on first use. "
+                                "Edge-TTS + kNN-VC: faster, works without reference."
+                            ),
+                        )
                         tr_ref = gr.Audio(
-                            label="Reference Voice Sample (optional, for voice conversion)",
+                            label="Reference Voice Sample (3–30 s, required for XTTS / optional for kNN-VC)",
                             type="filepath",
                         )
                         tr_sync = gr.Checkbox(
@@ -347,21 +376,27 @@ def build_ui():
                             label="Synchronize with source timing",
                             info="Adjust silence gaps to match source segment duration (speech is never stretched)",
                         )
-                        tr_topk = gr.Slider(
-                            minimum=1, maximum=16, value=4, step=1,
-                            label="Top-K Neighbors (used only with reference voice)",
-                            info="Higher = smoother, lower = more expressive",
-                        )
-                        tr_rate = gr.Slider(
-                            minimum=-30, maximum=30, value=0, step=1,
-                            label="TTS Speaking Rate (%)",
-                            info="Negative = slower, positive = faster. Default: 0",
-                        )
-                        tr_pitch = gr.Slider(
-                            minimum=-20, maximum=20, value=0, step=1,
-                            label="TTS Pitch (Hz)",
-                            info="Negative = deeper voice, positive = higher pitch. Default: 0",
-                        )
+                        with gr.Group():
+                            tr_xtts_speed = gr.Slider(
+                                minimum=0.5, maximum=2.0, value=1.0, step=0.05,
+                                label="XTTS Speaking Speed",
+                                info="Only for XTTS v2. 1.0 = normal speed.",
+                            )
+                            tr_topk = gr.Slider(
+                                minimum=1, maximum=16, value=4, step=1,
+                                label="Top-K Neighbors (Edge-TTS + kNN-VC only)",
+                                info="Higher = smoother, lower = more expressive",
+                            )
+                            tr_rate = gr.Slider(
+                                minimum=-30, maximum=30, value=0, step=1,
+                                label="TTS Speaking Rate % (Edge-TTS only)",
+                                info="Negative = slower, positive = faster.",
+                            )
+                            tr_pitch = gr.Slider(
+                                minimum=-20, maximum=20, value=0, step=1,
+                                label="TTS Pitch Hz (Edge-TTS only)",
+                                info="Negative = deeper, positive = higher pitch.",
+                            )
                         tr_step2_btn = gr.Button("Synthesize & Convert", variant="primary")
 
                     # ── Output ───────────────────────────────────────────────
@@ -386,13 +421,17 @@ def build_ui():
                 )
                 tr_step2_btn.click(
                     fn=run_step2_synthesize,
-                    inputs=[tr_segments, tr_duration, tr_ref, tr_lang, tr_topk, tr_sync, tr_rate, tr_pitch],
+                    inputs=[
+                        tr_segments, tr_duration, tr_ref, tr_lang,
+                        tr_topk, tr_sync, tr_rate, tr_pitch,
+                        tr_tts_backend, tr_xtts_speed,
+                    ],
                     outputs=[tr_output],
                 )
                 gr.Markdown(
                     "**Tips:** "
-                    "Reference voice is optional — without it you get translated TTS only. "
-                    "First use downloads Whisper (~150 MB) and translation package (~80 MB per language)."
+                    "XTTS v2 needs 3–30 s of clean reference speech and ~4 GB VRAM (CPU fallback available, slow). "
+                    "First use downloads Whisper (~150 MB), translation packages (~80 MB), and XTTS v2 (~1.8 GB)."
                 )
 
     return demo

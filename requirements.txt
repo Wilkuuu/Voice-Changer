@@ -16,3 +16,6 @@ edge-tts
 
 # AI segment polishing
 anthropic>=0.20.0
+
+# High-quality TTS with voice cloning (XTTS v2)
+TTS>=0.22.0

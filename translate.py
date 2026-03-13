@@ -553,6 +553,9 @@ def synthesize_from_edited(
     sync: bool = True,
     tts_rate: str = "+0%",
     tts_pitch: str = "+0Hz",
+    tts_backend: str = "edge",   # "edge" or "xtts"
+    xtts_ref_path: str | None = None,
+    xtts_speed: float = 1.0,
     progress_cb=None,
 ) -> None:
     """
@@ -561,6 +564,10 @@ def synthesize_from_edited(
     Parses the user-edited segment text (format: "[start - end] text per line"),
     synthesizes TTS for each segment, fits it to the original timing, then
     optionally applies kNN-VC voice conversion.
+
+    tts_backend="xtts": uses XTTS v2 with built-in voice cloning (xtts_ref_path required).
+                        Skips kNN-VC — voice cloning is done inside TTS.
+    tts_backend="edge": uses edge-tts, then optionally kNN-VC voice conversion.
     """
     def step(msg: str):
         print(msg)
@@ -570,6 +577,19 @@ def synthesize_from_edited(
     parsed = _SEGMENT_RE.findall(edited_text)
     if not parsed:
         raise ValueError("No segments found in edited text. Expected format: [start - end] Text...")
+
+    lang_code = LANGUAGES[target_language]["lang_code"]
+    use_xtts = tts_backend == "xtts" and xtts_ref_path and Path(xtts_ref_path).exists()
+
+    if use_xtts:
+        try:
+            import xtts_engine
+            if not xtts_engine.is_available():
+                step("XTTS not installed — falling back to edge-tts")
+                use_xtts = False
+        except ImportError:
+            step("XTTS not installed — falling back to edge-tts")
+            use_xtts = False
 
     voice = LANGUAGES[target_language]["tts_voice"]
     total_samples = int(total_duration * SAMPLE_RATE)
@@ -582,11 +602,27 @@ def synthesize_from_edited(
             continue
 
         start_f, end_f = float(start_s), float(end_s)
-        step(f"TTS {i+1}/{n}: {text[:70]}")
 
-        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
             tts_path = f.name
-        _tts_run(text, voice, tts_path, rate=tts_rate, pitch=tts_pitch)
+
+        if use_xtts:
+            step(f"XTTS {i+1}/{n}: {text[:70]}")
+            import xtts_engine
+            xtts_engine.synthesize(
+                text=text,
+                language=lang_code,
+                ref_audio_path=xtts_ref_path,
+                output_path=tts_path,
+                speed=xtts_speed,
+            )
+        else:
+            step(f"TTS {i+1}/{n}: {text[:70]}")
+            Path(tts_path).unlink(missing_ok=True)
+            with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
+                tts_path = f.name
+            _tts_run(text, voice, tts_path, rate=tts_rate, pitch=tts_pitch)
+
         tts_wav, _ = librosa.load(tts_path, sr=SAMPLE_RATE, mono=True)
         Path(tts_path).unlink(missing_ok=True)
 
@@ -604,7 +640,8 @@ def synthesize_from_edited(
             out = np.pad(out, (0, end_idx - len(out)))
         out[seg_start:end_idx] += tts_warped
 
-    if knn_vc is not None and matching_set is not None:
+    # Voice conversion — only for edge-tts backend (XTTS has built-in voice cloning)
+    if not use_xtts and knn_vc is not None and matching_set is not None:
         step("Applying voice conversion...")
         from voice_utils import extract_features_chunked, match_chunked
         tensor = torch.from_numpy(out).unsqueeze(0).to(next(knn_vc.parameters()).device)
