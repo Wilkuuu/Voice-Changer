@@ -434,7 +434,7 @@ def build_ui():
                             label="Synchronize with source timing",
                             info="Adjust silence gaps to match source segment duration (speech is never stretched)",
                         )
-                        with gr.Group():
+                        with gr.Group(visible=True) as tr_group_chatterbox:
                             gr.Markdown("**Chatterbox settings**")
                             tr_cb_exaggeration = gr.Slider(
                                 minimum=0.0, maximum=1.0, value=0.5, step=0.05,
@@ -446,7 +446,7 @@ def build_ui():
                                 label="CFG weight (guidance)",
                                 info="Higher = more faithful to reference voice.",
                             )
-                        with gr.Group():
+                        with gr.Group(visible=False) as tr_group_f5tts:
                             gr.Markdown("**F5-TTS settings**")
                             tr_f5_ref_text = gr.Textbox(
                                 label="Reference audio transcript (F5-TTS)",
@@ -463,26 +463,27 @@ def build_ui():
                                 minimum=0.5, maximum=2.0, value=1.0, step=0.05,
                                 label="F5-TTS Speaking Speed",
                             )
-                        with gr.Group():
-                            gr.Markdown("**XTTS v2 / Edge-TTS settings**")
+                        with gr.Group(visible=False) as tr_group_xtts:
+                            gr.Markdown("**XTTS v2 settings**")
                             tr_xtts_speed = gr.Slider(
                                 minimum=0.5, maximum=2.0, value=1.0, step=0.05,
                                 label="XTTS Speaking Speed",
-                                info="Only for XTTS v2.",
                             )
+                        with gr.Group(visible=False) as tr_group_edge:
+                            gr.Markdown("**Edge-TTS settings**")
                             tr_topk = gr.Slider(
                                 minimum=1, maximum=16, value=4, step=1,
-                                label="Top-K Neighbors (Edge-TTS + kNN-VC only)",
+                                label="Top-K Neighbors (kNN-VC only)",
                             )
                             tr_rate = gr.Slider(
                                 minimum=-30, maximum=30, value=0, step=1,
-                                label="TTS Speaking Rate % (Edge-TTS only)",
+                                label="TTS Speaking Rate %",
                                 info="Negative = slower, positive = faster.",
                             )
                             tr_pitch = gr.Slider(
                                 minimum=-20, maximum=20, value=0, step=1,
-                                label="TTS Pitch Hz (Edge-TTS only)",
-                                info="Negative = deeper, positive = higher pitch.",
+                                label="TTS Pitch Hz",
+                                info="Negative = deeper, positive = higher.",
                             )
                         tr_step2_btn = gr.Button("Synthesize & Convert", variant="primary")
 
@@ -506,6 +507,20 @@ def build_ui():
                     inputs=[tr_segments, tr_lang, tr_context, tr_api_key],
                     outputs=[tr_segments],
                 )
+                def _update_backend_ui(backend):
+                    return (
+                        gr.update(visible=backend == "Chatterbox"),
+                        gr.update(visible=backend == "F5-TTS"),
+                        gr.update(visible=backend == "XTTS v2"),
+                        gr.update(visible=backend == "Edge-TTS + OpenVoice"),
+                    )
+
+                tr_tts_backend.change(
+                    fn=_update_backend_ui,
+                    inputs=[tr_tts_backend],
+                    outputs=[tr_group_chatterbox, tr_group_f5tts, tr_group_xtts, tr_group_edge],
+                )
+
                 tr_step2_btn.click(
                     fn=run_step2_synthesize,
                     inputs=[
