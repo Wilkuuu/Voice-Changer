@@ -89,7 +89,18 @@ _WAVLM_HOP = 320
 # Default chunk: ~20 seconds of audio per HiFiGAN call (safe for 12 GB VRAM)
 MATCH_CHUNK_FRAMES = 1000
 # Overlap added on each side so HiFiGAN has receptive-field context at boundaries
-MATCH_OVERLAP_FRAMES = 10
+MATCH_OVERLAP_FRAMES = 32
+# Samples to crossfade at chunk boundaries (64 ms) — reduces clicks and discontinuities
+CROSSFADE_SAMPLES = 1024
+
+
+def _cosine_crossfade(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """Blend two 1D tensors with cosine crossfade. len(a) == len(b)."""
+    n = a.shape[0]
+    t = torch.linspace(0, 1, n + 2, device=a.device, dtype=a.dtype)[1:-1]
+    fade_out = 0.5 * (1 + torch.cos(t * math.pi))   # 1 -> 0
+    fade_in = 0.5 * (1 + torch.cos((1 - t) * math.pi))  # 0 -> 1
+    return fade_out * a + fade_in * b
 
 
 def match_chunked(
@@ -102,13 +113,12 @@ def match_chunked(
 ) -> torch.Tensor:
     """Run knn_vc.match() in chunks to avoid CUDA OOM on long audio.
 
-    kNN lookup is O(N·M) and fast on GPU; HiFiGAN is the memory bottleneck.
-    Each chunk is ~20 s; audio parts are concatenated.
-    A small overlap is added around each chunk for HiFiGAN context and trimmed after.
+    Uses overlap and cosine crossfade at chunk boundaries to avoid clicks and
+    discontinuities from the vocoder. kNN lookup is O(N·M); HiFiGAN is the
+    memory bottleneck.
     """
     if chunk_frames is None:
         chunk_frames = MATCH_CHUNK_FRAMES
-    # knn_vc.match() has device='cpu' as default but HiFiGAN must run on model's device
     device = str(next(knn_vc.parameters()).device)
     total = query_seq.shape[0]
     if total <= chunk_frames:
@@ -119,28 +129,47 @@ def match_chunked(
         return knn_vc.match(query_seq, matching_set, topk=topk, device=device)
 
     n_chunks = math.ceil(total / chunk_frames)
+    crossfade = min(CROSSFADE_SAMPLES, (MATCH_OVERLAP_FRAMES * _WAVLM_HOP) // 2)
     parts: list[torch.Tensor] = []
+    right_tail_prev: torch.Tensor | None = None
 
     for i in range(n_chunks):
         start = i * chunk_frames
         end = min(start + chunk_frames, total)
-
         s_ext = max(0, start - MATCH_OVERLAP_FRAMES)
         e_ext = min(total, end + MATCH_OVERLAP_FRAMES)
 
         wav = knn_vc.match(query_seq[s_ext:e_ext], matching_set, topk=topk, device=device).squeeze()
-
         trim_start = (start - s_ext) * _WAVLM_HOP
         trim_end = (e_ext - end) * _WAVLM_HOP
-        wav = wav[trim_start: len(wav) - trim_end if trim_end else len(wav)]
+        L = wav.shape[0]
 
-        parts.append(wav)
+        if trim_end < crossfade or (L - trim_start - trim_end) < crossfade:
+            wav = wav[trim_start : L - trim_end if trim_end else L]
+            parts.append(wav)
+            right_tail_prev = None
+        else:
+            left_tail = wav[trim_start : trim_start + crossfade]
+            main = wav[trim_start + crossfade : L - trim_end - crossfade]
+            right_tail = wav[L - trim_end - crossfade : L - trim_end]
+
+            if right_tail_prev is not None:
+                blended = _cosine_crossfade(right_tail_prev.to(wav.device), left_tail)
+                parts.append(blended)
+            else:
+                parts.append(left_tail)
+
+            parts.append(main)
+            right_tail_prev = right_tail
+
         msg = f"Vocoding: chunk {i+1}/{n_chunks} ({end}/{total} frames)"
         print(msg)
         if progress_cb:
             progress_cb(msg)
-
         torch.cuda.empty_cache()
+
+    if right_tail_prev is not None:
+        parts.append(right_tail_prev)
 
     return torch.cat(parts).unsqueeze(0)
 

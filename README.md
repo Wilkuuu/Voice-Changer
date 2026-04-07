@@ -1,16 +1,55 @@
 # Voice Changer — Zero-Shot Voice Conversion
 
-Speech-to-speech voice conversion without training. Based on **kNN-VC**
-([bshall/knn-vc](https://github.com/bshall/knn-vc)) — uses HuBERT/WavLM features
-and k-nearest neighbor matching to transfer a speaker's voice style.
+Speech-to-speech voice conversion without training.
+
+- **Branch `natural-clone`:** **OpenVoice** tone-color transfer (more natural cloning, GPU).
+- **Branch `gpu` / `main`:** **kNN-VC** (HuBERT/WavLM + k-NN + HiFiGAN).
+
+## Branch: natural-clone (OpenVoice)
+
+The **Voice Conversion** tab uses [OpenVoice](https://github.com/myshell-ai/OpenVoice) (via `openvoice-cli`) for natural voice cloning from a single reference sample.
+
+### Installation (natural-clone)
+
+```bash
+git checkout natural-clone
+pip install -r requirements.txt
+```
+
+For GPU (recommended):
+
+```bash
+pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu118
+```
+
+If dependency conflicts appear (e.g. `librosa`), use a dedicated venv:
+
+```bash
+python -m venv .venv-openvoice
+source .venv-openvoice/bin/activate  # or .venv-openvoice\Scripts\activate on Windows
+pip install -r requirements.txt
+pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu118
+```
+
+### Usage (natural-clone)
+
+- **Voice Conversion:** Upload input audio + reference voice → Convert. No Top-K or extra options; OpenVoice handles tone transfer.
+- **Translate & Convert:** Unchanged (Whisper + TTS + optional kNN-VC).
+
+---
+
+## Branch: gpu / main (kNN-VC)
+
+Based on [bshall/knn-vc](https://github.com/bshall/knn-vc) — HuBERT/WavLM features and k-NN matching.
 
 ## Requirements
 
 - Python 3.9+
 - PyTorch (CPU or CUDA)
-- ~1.5 GB disk space for model weights (downloaded automatically on first run)
+- ~1.5 GB disk space for kNN-VC weights (downloaded automatically on first run)
+- For natural-clone: `openvoice-cli` (see above)
 
-## Installation
+## Installation (default)
 
 ```bash
 pip install -r requirements.txt
