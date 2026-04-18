@@ -53,11 +53,58 @@ _seed_infer_module: Any = None
 _seed_infer_original_load_models: Any = None
 _seed_infer_bundle_cache: dict[str, Any] = {"b": None}
 
+# Original BigVGAN ``_from_pretrained`` (unbound) — saved once for idempotent wrapping.
+_bigvgan_from_pretrained_orig: Any = None
+
 _main_lock = threading.Lock()
 
 
 def _log(msg: str) -> None:
     print(f"[Seed-VC] {msg}", flush=True)
+
+
+def _apply_bigvgan_huggingface_hub_compat() -> None:
+    """
+    huggingface_hub's ``PyTorchModelHubMixin`` no longer passes ``proxies`` and
+    ``resume_download`` into ``_from_pretrained``, but NVIDIA BigVGAN (vendored
+    inside ``seed-vc``) still declares them as required keyword-only parameters.
+    Supply defaults so ``BigVGAN.from_pretrained`` works on modern hub versions.
+    """
+    global _bigvgan_from_pretrained_orig
+
+    Big = None
+    for mod_name in ("seed_vc.modules.bigvgan.bigvgan", "seed_vc.modules.bigvgan"):
+        try:
+            m = importlib.import_module(mod_name)
+        except Exception:
+            continue
+        Big = getattr(m, "BigVGAN", None)
+        if Big is not None:
+            break
+    if Big is None:
+        return
+    if getattr(Big, "_voice_changer_hub_compat_patched", False):
+        return
+
+    cm = Big.__dict__.get("_from_pretrained")
+    if cm is None:
+        return
+    try:
+        orig_fn = cm.__func__
+    except AttributeError:
+        return
+
+    if _bigvgan_from_pretrained_orig is None:
+        _bigvgan_from_pretrained_orig = orig_fn
+
+    def _wrapper(cls: Any, *args: Any, **kwargs: Any) -> Any:
+        kwargs.setdefault("proxies", None)
+        kwargs.setdefault("resume_download", False)
+        return _bigvgan_from_pretrained_orig(cls, *args, **kwargs)
+
+    Big._from_pretrained = classmethod(_wrapper)  # type: ignore[assignment]
+    Big._voice_changer_hub_compat_patched = True
+    _log("BigVGAN._from_pretrained: huggingface_hub compatibility patch applied.")
 
 
 def _prepare_seed_hf_cache() -> None:
@@ -279,6 +326,7 @@ def get_model():
             _log("loading seed_vc.inference (in-process, cached load_models)...")
             mod = importlib.import_module("seed_vc.inference")
             _prepare_seed_hf_cache()
+            _apply_bigvgan_huggingface_hub_compat()
             _patch_seed_inference_load_models(mod)
             _model = mod
             _device = dev
