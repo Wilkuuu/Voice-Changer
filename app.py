@@ -21,6 +21,8 @@ if "--cpu" in sys.argv:
     _os_early.environ["CUDA_VISIBLE_DEVICES"] = ""
 
 import argparse
+import importlib
+import importlib.util
 import os
 import tempfile
 from pathlib import Path
@@ -98,6 +100,39 @@ def _has_seedvc() -> bool:
         return bool(seed_vc_engine.is_available())
     except Exception:
         return False
+
+
+def _ensure_seedvc_engine_hot_reload() -> None:
+    """
+    Reload ``seed_vc_engine`` when its source file changed on disk.
+
+    With ``docker compose`` bind-mounting ``.:/app``, ``git pull`` updates the
+    ``.py`` but the old module object can stay in ``sys.modules`` until the
+    process restarts — users then still hit the previous buggy loader. A
+    mtime check fixes that without requiring ``docker compose restart`` every
+    time.
+    """
+    spec = importlib.util.find_spec("seed_vc_engine")
+    if spec is None or not getattr(spec, "origin", None):
+        return
+    disk_m = Path(spec.origin).stat().st_mtime
+    sm = sys.modules.get("seed_vc_engine")
+    if sm is None:
+        return
+    rec = getattr(sm, "_ENGINE_FILE_MTIME", None)
+    if rec is None:
+        return
+    if abs(disk_m - rec) < 1e-9:
+        return
+    try:
+        sm.unload()
+    except Exception:
+        pass
+    importlib.reload(sm)
+    print(
+        f"[app] seed_vc_engine hot-reload (file mtime {rec:.6f} -> {disk_m:.6f})",
+        flush=True,
+    )
 
 
 def _has_speaker_sim() -> bool:
@@ -271,6 +306,7 @@ def run_conversion(
                 log_progress(f"Chatterbox VC candidate {i+1} failed, continuing: {e}")
 
     elif vc_model == "Seed-VC":
+        _ensure_seedvc_engine_hot_reload()
         import seed_vc_engine
         if not seed_vc_engine.is_available():
             raise gr.Error("Seed-VC not installed. Run: pip install seed-vc")
@@ -284,8 +320,17 @@ def run_conversion(
                 )
                 candidates.append((arr, sr))
             except Exception as e:
+                try:
+                    seed_vc_engine.unload()
+                except Exception:
+                    pass
                 if not candidates:
-                    raise gr.Error(f"Seed-VC failed: {e}") from e
+                    raise gr.Error(
+                        f"Seed-VC failed: {e}\n"
+                        "If you use Docker with a bind-mounted repo, this app auto-reloads "
+                        "``seed_vc_engine`` when its file changes; otherwise run "
+                        "``docker compose restart`` after ``git pull``."
+                    ) from e
                 log_progress(f"Seed-VC candidate {i+1} failed, continuing: {e}")
 
     elif vc_model == "Chatterbox TTS":

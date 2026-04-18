@@ -76,7 +76,9 @@ def _prepare_seed_hf_cache() -> None:
 def _patch_seed_inference_load_models(mod: Any) -> None:
     """Cache the heavy tuple returned by ``load_models`` — ``main()`` calls it every time."""
     global _seed_infer_module, _seed_infer_original_load_models
-    if _seed_infer_module is mod:
+    # Idempotent: ``importlib.reload(seed_vc_engine)`` must not wrap ``load_models`` twice.
+    if getattr(mod, "_voice_changer_seed_vc_patched", False):
+        _seed_infer_module = mod
         return
     _seed_infer_original_load_models = mod.load_models
     _seed_infer_module = mod
@@ -87,13 +89,19 @@ def _patch_seed_inference_load_models(mod: Any) -> None:
         return _seed_infer_bundle_cache["b"]
 
     mod.load_models = _cached_load_models
+    mod._voice_changer_seed_vc_patched = True
 
 
 def _unpatch_seed_inference() -> None:
     global _seed_infer_module, _seed_infer_original_load_models
     if _seed_infer_module is not None and _seed_infer_original_load_models is not None:
         try:
-            _seed_infer_module.load_models = _seed_infer_original_load_models
+            if getattr(_seed_infer_module, "_voice_changer_seed_vc_patched", False):
+                _seed_infer_module.load_models = _seed_infer_original_load_models
+                try:
+                    delattr(_seed_infer_module, "_voice_changer_seed_vc_patched")
+                except Exception:
+                    pass
         except Exception:
             pass
     _seed_infer_module = None
@@ -360,3 +368,7 @@ def unload() -> None:
         _device = None
         _empty_cache()
         _log("unloaded.")
+
+
+# Mtime of this file at import — used by app.py to hot-reload after ``git pull`` on a bind mount.
+_ENGINE_FILE_MTIME = Path(__file__).stat().st_mtime
