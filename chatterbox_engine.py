@@ -15,6 +15,8 @@ Note: Every output embeds Resemble AI's PerTh neural watermark (inaudible).
 
 from __future__ import annotations
 
+from device_utils import empty_cache as _empty_cache, select_device as _select_device
+
 _model = None
 _device: str | None = None
 
@@ -70,9 +72,8 @@ def is_available() -> bool:
 def get_model():
     global _model, _device
     if _model is None:
-        import torch
         _patch_transformers_sdpa()
-        _device = "cuda" if torch.cuda.is_available() else "cpu"
+        _device = _select_device()
         try:
             from chatterbox.mtl_tts import ChatterboxMultilingualTTS
             print(f"[Chatterbox] Loading Multilingual model on {_device}...")
@@ -129,10 +130,9 @@ def unload() -> None:
     global _model
     if _model is not None:
         try:
-            import torch
             del _model
             _model = None
-            torch.cuda.empty_cache()
+            _empty_cache()
             print("[Chatterbox] TTS model unloaded.")
         except Exception:
             _model = None
@@ -154,9 +154,8 @@ def is_vc_available() -> bool:
 def get_vc_model():
     global _vc_model, _device
     if _vc_model is None:
-        import torch
         if _device is None:
-            _device = "cuda" if torch.cuda.is_available() else "cpu"
+            _device = _select_device()
         print(f"[Chatterbox VC] Loading voice conversion model on {_device}...")
         from chatterbox.vc import ChatterboxVC
         _vc_model = ChatterboxVC.from_pretrained(device=_device)
@@ -167,21 +166,43 @@ def get_vc_model():
 def convert_voice(
     input_path: str,
     ref_path: str,
-    output_path: str,
-) -> None:
+    output_path: str | None = None,
+    seed: int | None = None,
+) -> tuple[str | None, "np.ndarray", int]:  # type: ignore[name-defined]
     """
     Convert the voice in input_path to match the speaker in ref_path.
+
+    Returns a tuple ``(output_path_or_None, wav_float32, sample_rate)``. Keeps
+    the model's native sample rate (24 kHz for Chatterbox VC) — callers that
+    need 16 kHz should resample downstream.
 
     Args:
         input_path  : source audio (content to preserve)
         ref_path    : reference speaker audio (voice identity to apply)
-        output_path : output .wav path
+        output_path : optional .wav path; if None the file is not written
+        seed        : optional seed (for best-of-N selection)
     """
+    import numpy as np
+    import torch
     import torchaudio as ta
 
     model = get_vc_model()
+
+    if seed is not None:
+        torch.manual_seed(int(seed))
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(int(seed))
+
     wav = model.generate(audio=input_path, target_voice_path=ref_path)
-    ta.save(output_path, wav, model.sr)
+    sr = int(getattr(model, "sr", 24000))
+
+    if output_path is not None:
+        ta.save(output_path, wav, sr)
+
+    arr = wav.detach().cpu().numpy().astype(np.float32)
+    if arr.ndim == 2:
+        arr = arr.mean(axis=0)
+    return output_path, arr, sr
 
 
 def unload_vc() -> None:
@@ -189,10 +210,9 @@ def unload_vc() -> None:
     global _vc_model
     if _vc_model is not None:
         try:
-            import torch
             del _vc_model
             _vc_model = None
-            torch.cuda.empty_cache()
+            _empty_cache()
             print("[Chatterbox VC] Model unloaded.")
         except Exception:
             _vc_model = None

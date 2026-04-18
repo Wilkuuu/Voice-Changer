@@ -1,1 +1,39 @@
+# Python virtual envs
 /venv
+/.venv
+/venv-*
+/.venv-*
+
+# Python byte-code / caches
+__pycache__/
+*.py[cod]
+*$py.class
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# Distribution / packaging
+*.egg-info/
+build/
+dist/
+
+# Local secrets / environment
+.env
+.env.*
+!.env.example
+
+# Local input/output data (Docker bind-mount default lives here)
+/data/
+
+# Model caches sometimes dropped next to the repo
+*.pt
+*.pth
+*.safetensors
+*.onnx
+
+# IDE / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp

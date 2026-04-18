@@ -28,3 +28,20 @@ chatterbox-tts
 # Polish community checkpoint: huggingface.co/Gregniuki/F5-tts_English_German_Polish
 # pip install f5-tts
 f5-tts
+
+# ── Tab 1 VC cloning quality ──────────────────────────────────────────────
+# Reference preprocessing (denoise / LUFS / VAD / best-window selection)
+noisereduce
+pyloudnorm
+silero-vad
+
+# Speaker similarity scoring (best-of-N selection + UI label).
+# Primary: SpeechBrain ECAPA-TDNN. Fallback: Resemblyzer.
+speechbrain
+resemblyzer
+
+# SOTA zero-shot voice conversion — stronger identity transfer than OpenVoice
+# If the PyPI build fails, try:
+#     pip install git+https://github.com/Plachtaa/seed-vc
+seed-vc
+

@@ -14,6 +14,7 @@ translated audio land at the same moments as speech peaks in the original.
 """
 
 import asyncio
+import os
 import re
 import threading
 import tempfile
@@ -47,14 +48,57 @@ LANGUAGES: dict[str, dict] = {
 }
 
 _whisper_model: WhisperModel | None = None
+_whisper_cfg: tuple[str, str, str] | None = None  # (size, device, compute_type)
 _installed_pairs: set[tuple[str, str]] = set()
 
 
-def get_whisper(model_size: str = "base") -> WhisperModel:
-    global _whisper_model
-    if _whisper_model is None:
-        print(f"Loading Whisper-{model_size} (int8, CPU)...")
-        _whisper_model = WhisperModel(model_size, device="cpu", compute_type="int8")
+def _whisper_auto_device_compute() -> tuple[str, str]:
+    """Pick the best (device, compute_type) for faster-whisper on this host."""
+    forced = (os.environ.get("VOICE_CHANGER_FORCE_DEVICE") or "").strip().lower()
+    try:
+        if forced == "cpu":
+            return "cpu", "int8"
+        if torch.cuda.is_available() and forced != "cpu":
+            return "cuda", "int8_float16"
+    except Exception:
+        pass
+    return "cpu", "int8"
+
+
+def get_whisper(
+    model_size: str = "base",
+    device: str | None = None,
+    compute_type: str | None = None,
+) -> WhisperModel:
+    """
+    Lazy-load faster-whisper model with optional size/device override.
+
+    - ``model_size``: ``tiny|base|small|medium|large-v2|large-v3`` etc.
+    - ``device``: ``cpu|cuda|auto`` (None = auto)
+    - ``compute_type``: ``int8`` (CPU), ``int8_float16`` (GPU fast), ``float16`` (GPU high-q)
+
+    Re-loads when any of the three parameters change.
+    """
+    global _whisper_model, _whisper_cfg
+    if device in (None, "auto"):
+        device, auto_ct = _whisper_auto_device_compute()
+        if compute_type is None:
+            compute_type = auto_ct
+    if compute_type is None:
+        compute_type = "int8_float16" if device == "cuda" else "int8"
+
+    target = (str(model_size), str(device), str(compute_type))
+    if _whisper_model is None or _whisper_cfg != target:
+        if _whisper_model is not None:
+            print(f"Switching Whisper: {_whisper_cfg} → {target}")
+            try:
+                del _whisper_model
+            except Exception:
+                pass
+            _whisper_model = None
+        print(f"Loading Whisper-{model_size} on {device} ({compute_type})...")
+        _whisper_model = WhisperModel(model_size, device=device, compute_type=compute_type)
+        _whisper_cfg = target
         print("Whisper loaded.")
     return _whisper_model
 
@@ -448,20 +492,25 @@ _WHISPER_HALLUCINATIONS = {
 def transcribe_only(
     audio_path: str,
     progress_cb=None,
+    model_size: str = "base",
 ) -> tuple[str, str, float]:
     """
     Transcribe audio in its original language without translation.
 
     Returns (plain_text, detected_language_code, duration).
     Filters common Whisper hallucinations.
+
+    ``model_size`` allows the caller to request a larger Whisper model
+    (``medium``, ``large-v3``) when higher transcription accuracy matters
+    (e.g. Chatterbox TTS path where the text feeds a re-synthesis step).
     """
     def step(msg: str):
         print(msg)
         if progress_cb:
             progress_cb(msg)
 
-    step("Transcribing (Whisper, original language)...")
-    whisper = get_whisper()
+    step(f"Transcribing (Whisper-{model_size}, original language)...")
+    whisper = get_whisper(model_size=model_size)
     segments_gen, info = whisper.transcribe(audio_path, task="transcribe", beam_size=5)
     segments = list(segments_gen)
     step(f"Detected [{info.language}], {info.duration:.1f}s, {len(segments)} segments")

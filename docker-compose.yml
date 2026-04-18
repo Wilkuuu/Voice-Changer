@@ -1,0 +1,95 @@
+# docker-compose for Voice Changer
+#
+#   GPU (default):       docker compose up --build
+#   CPU only:            docker compose --profile cpu up --build app-cpu
+#
+# Requirements on the host:
+#   - NVIDIA driver (container ships its own CUDA libs)
+#   - NVIDIA Container Toolkit (nvidia-ctk) so Docker can pass the GPU in
+#
+# Persistent caches (Hugging Face, torch.hub, SpeechBrain, Argos) live in
+# named volumes so heavy model downloads survive ``docker compose down``.
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        TORCH_INDEX_URL: https://download.pytorch.org/whl/cu121
+    image: voice-changer:gpu
+    container_name: voice-changer
+    ports:
+      - "${VC_PORT:-7862}:7862"
+    environment:
+      VOICE_CHANGER_FORCE_DEVICE: cuda
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+      GRADIO_SERVER_NAME: 0.0.0.0
+      GRADIO_SERVER_PORT: "7862"
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+    volumes:
+      # Live code mount — edit on the host, restart the container to apply.
+      - .:/app
+      # Persistent model caches (Hugging Face, torch.hub, SpeechBrain, numba, etc.)
+      - root_cache:/root/.cache
+      # Argos Translate language packages (downloaded on first use).
+      - argos:/root/.local/share/argos-translate
+      # Audio input directory on the host (read-write so ref_preprocess can
+      # write sidecar cache files next to source audio).
+      - ${HOST_AUDIO:-./data}:/data
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    ipc: host
+    shm_size: "2gb"
+    restart: unless-stopped
+    command:
+      - python
+      - app.py
+      - --host
+      - 0.0.0.0
+      - --port
+      - "7862"
+      - --low-vram
+
+  app-cpu:
+    profiles: ["cpu"]
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        TORCH_INDEX_URL: https://download.pytorch.org/whl/cpu
+    image: voice-changer:cpu
+    container_name: voice-changer-cpu
+    ports:
+      - "${VC_PORT:-7862}:7862"
+    environment:
+      VOICE_CHANGER_FORCE_DEVICE: cpu
+      GRADIO_SERVER_NAME: 0.0.0.0
+      GRADIO_SERVER_PORT: "7862"
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+    volumes:
+      - .:/app
+      - root_cache_cpu:/root/.cache
+      - argos:/root/.local/share/argos-translate
+      - ${HOST_AUDIO:-./data}:/data
+    ipc: host
+    shm_size: "2gb"
+    restart: unless-stopped
+    command:
+      - python
+      - app.py
+      - --host
+      - 0.0.0.0
+      - --port
+      - "7862"
+      - --cpu
+      - --low-vram
+
+volumes:
+  root_cache:
+  root_cache_cpu:
+  argos:

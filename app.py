@@ -9,7 +9,16 @@ Usage:
     python app.py
     python app.py --share   # public URL via Gradio tunnel
     python app.py --port 7861
+    python app.py --cpu --low-vram   # brak GPU / mało VRAM (wolniej, stabilniej)
 """
+
+import sys
+
+# Hide GPUs before torch/CUDA init — must run before `import torch`.
+if "--cpu" in sys.argv:
+    import os as _os_early
+
+    _os_early.environ["CUDA_VISIBLE_DEVICES"] = ""
 
 import argparse
 import os
@@ -24,15 +33,79 @@ import librosa
 import torch
 
 import translate as tr
+import tagged_tts
 
 try:
-    from openvoice_engine import is_available as openvoice_available, convert as openvoice_convert
+    from openvoice_engine import (
+        DEFAULT_CHUNK_DURATION_SEC as _OV_DEFAULT_CHUNK_SEC,
+        convert as openvoice_convert,
+        is_available as openvoice_available,
+    )
 except ImportError:
     openvoice_available = lambda: False
     openvoice_convert = None
+    _OV_DEFAULT_CHUNK_SEC = 18.0
 
 SAMPLE_RATE = 16000
 _model = None
+# OpenVoice chunk length (seconds); main() may shrink in --low-vram mode.
+_RUNTIME = {"openvoice_chunk_sec": float(_OV_DEFAULT_CHUNK_SEC)}
+
+
+def _has_bark() -> bool:
+    try:
+        import bark  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
+def _has_chatterbox_tts() -> bool:
+    try:
+        import chatterbox_engine
+        return bool(chatterbox_engine.is_available())
+    except Exception:
+        return False
+
+
+def _has_chatterbox_vc() -> bool:
+    try:
+        import chatterbox_engine
+        return bool(chatterbox_engine.is_vc_available())
+    except Exception:
+        return False
+
+
+def _has_xtts() -> bool:
+    try:
+        import xtts_engine
+        return bool(xtts_engine.is_available())
+    except Exception:
+        return False
+
+
+def _has_f5tts() -> bool:
+    try:
+        import f5tts_engine
+        return bool(f5tts_engine.is_available())
+    except Exception:
+        return False
+
+
+def _has_seedvc() -> bool:
+    try:
+        import seed_vc_engine
+        return bool(seed_vc_engine.is_available())
+    except Exception:
+        return False
+
+
+def _has_speaker_sim() -> bool:
+    try:
+        import speaker_sim
+        return bool(speaker_sim.is_available())
+    except Exception:
+        return False
 
 
 def get_model():
@@ -69,18 +142,82 @@ def load_audio_array(path: str) -> torch.Tensor:
     return torch.from_numpy(wav).unsqueeze(0)  # (1, T)
 
 
+def _write_wav(arr, sr: int, suffix: str = ".wav") -> str:
+    """Persist a float32 mono ndarray to a temp WAV file. Returns the path."""
+    import soundfile as sf
+
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+        out_path = tmp.name
+    sf.write(out_path, arr, int(sr), subtype="PCM_16")
+    return out_path
+
+
+def _prepared_ref_path(ref_path: str, preprocess: bool, denoise: bool) -> tuple[str, str]:
+    """
+    Return (path_used_by_engine, status_text).
+
+    When ``preprocess`` is True, runs ``ref_preprocess.prepare_reference`` and
+    returns the sidecar cache path. Otherwise returns the original path.
+    """
+    if not preprocess:
+        return ref_path, "reference: raw (preprocess off)"
+    try:
+        import ref_preprocess as rp
+
+        _, _, meta = rp.prepare_reference(
+            ref_path,
+            target_sr=24_000,
+            target_seconds=20.0,
+            denoise=bool(denoise),
+            use_cache=True,
+        )
+        status = (
+            f"reference: {Path(meta.cached_path).name} "
+            f"({meta.duration_sec:.1f}s, SNR~{meta.snr_db:.1f}dB"
+            f"{', denoised' if meta.denoised else ''})"
+        )
+        return meta.cached_path, status
+    except Exception as e:
+        print(f"[run_conversion] preprocess failed ({e}) — using raw reference.", flush=True)
+        return ref_path, f"reference: raw (preprocess failed: {e})"
+
+
+def _similarity_label(ref_wav_path: str, out_arr, out_sr: int) -> tuple[float, str]:
+    try:
+        import speaker_sim
+
+        if not speaker_sim.is_available():
+            return -1.0, "Speaker similarity: n/a (install speechbrain or resemblyzer)"
+        score = speaker_sim.similarity(ref_wav_path, out_arr, out_sr=int(out_sr))
+        if score < 0:
+            return -1.0, "Speaker similarity: n/a"
+        return score, f"Speaker similarity: {score:.2f} ({speaker_sim.label(score)})"
+    except Exception as e:
+        return -1.0, f"Speaker similarity: n/a ({e})"
+
+
 def run_conversion(
     input_audio, reference_audio, vc_model,
     cb_exaggeration, cb_cfg_weight,
     tau, temperature,
+    preprocess_ref, denoise_ref, best_of_n, apply_openvoice_post,
+    whisper_size="base",
     progress=gr.Progress(),
 ):
-    """Tab 1: Voice conversion — Chatterbox VC, Chatterbox TTS, or OpenVoice."""
+    """
+    Tab 1: Voice conversion. Supports Chatterbox VC, Seed-VC, OpenVoice,
+    Chatterbox TTS, with preprocessing of the reference sample, best-of-N
+    candidates, and optional OpenVoice post-processing.
+
+    Returns
+    -------
+    (converted_audio_path, similarity_label)
+    """
     input_path = _audio_path(input_audio)
-    ref_path = _audio_path(reference_audio)
+    ref_path_raw = _audio_path(reference_audio)
     if not input_path or not Path(input_path).exists():
         raise gr.Error("Please upload an input audio file.")
-    if not ref_path or not Path(ref_path).exists():
+    if not ref_path_raw or not Path(ref_path_raw).exists():
         raise gr.Error("Please upload a reference voice sample.")
 
     def log_progress(msg: str, p: float | None = None) -> None:
@@ -90,74 +227,182 @@ def run_conversion(
         else:
             progress(None, desc=msg)
 
+    # Free VRAM held by *other* VC engines before loading the selected one.
+    try:
+        import device_utils
+
+        keep_map = {
+            "Chatterbox VC":  ("chatterbox_engine",),
+            "Chatterbox TTS": ("chatterbox_engine",),
+            "Seed-VC":        ("seed_vc_engine",),
+            "OpenVoice":      ("openvoice_engine",),
+        }
+        device_utils.unload_all(except_modules=keep_map.get(vc_model, ()))
+    except Exception as e:
+        print(f"[run_conversion] unload_all failed: {e}", flush=True)
+
+    ref_path, ref_status = _prepared_ref_path(
+        ref_path_raw, preprocess=bool(preprocess_ref), denoise=bool(denoise_ref)
+    )
+    log_progress(ref_status, 0.05)
+
+    n = max(1, int(best_of_n or 1))
+
+    # ── Produce candidates ────────────────────────────────────────────────
+    candidates: list[tuple[object, int]] = []  # (np.ndarray float32 mono, sr)
+    engine_used = vc_model
+
     if vc_model == "Chatterbox VC":
         import chatterbox_engine
         if not chatterbox_engine.is_vc_available():
             raise gr.Error("Chatterbox VC not available. Run: pip install chatterbox-tts")
-        log_progress("Loading Chatterbox VC model (first run downloads weights)...", 0.0)
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-            out_path = tmp.name
-        try:
-            chatterbox_engine.convert_voice(
-                input_path=input_path,
-                ref_path=ref_path,
-                output_path=out_path,
-            )
-        except Exception as e:
-            Path(out_path).unlink(missing_ok=True)
-            raise gr.Error(f"Chatterbox VC failed: {e}") from e
-        log_progress("Done.", 1.0)
-        return out_path
+        log_progress("Loading Chatterbox VC model (first run downloads weights)...", 0.1)
+        for i in range(n):
+            log_progress(f"Chatterbox VC: candidate {i+1}/{n}", 0.1 + 0.6 * (i / max(1, n)))
+            try:
+                _, arr, sr = chatterbox_engine.convert_voice(
+                    input_path=input_path, ref_path=ref_path,
+                    output_path=None, seed=(None if n == 1 else 1000 + i),
+                )
+                candidates.append((arr, sr))
+            except Exception as e:
+                if not candidates:
+                    raise gr.Error(f"Chatterbox VC failed: {e}") from e
+                log_progress(f"Chatterbox VC candidate {i+1} failed, continuing: {e}")
+
+    elif vc_model == "Seed-VC":
+        import seed_vc_engine
+        if not seed_vc_engine.is_available():
+            raise gr.Error("Seed-VC not installed. Run: pip install seed-vc")
+        log_progress("Loading Seed-VC model...", 0.1)
+        for i in range(n):
+            log_progress(f"Seed-VC: candidate {i+1}/{n}", 0.1 + 0.6 * (i / max(1, n)))
+            try:
+                _, arr, sr = seed_vc_engine.convert_voice(
+                    input_path=input_path, ref_path=ref_path,
+                    output_path=None, seed=(None if n == 1 else 2000 + i),
+                )
+                candidates.append((arr, sr))
+            except Exception as e:
+                if not candidates:
+                    raise gr.Error(f"Seed-VC failed: {e}") from e
+                log_progress(f"Seed-VC candidate {i+1} failed, continuing: {e}")
 
     elif vc_model == "Chatterbox TTS":
         import chatterbox_engine
         if not chatterbox_engine.is_available():
             raise gr.Error("Chatterbox not available. Run: pip install chatterbox-tts")
-        log_progress("Transcribing input audio (original language)...", 0.1)
+        log_progress(f"Transcribing input audio (Whisper-{whisper_size})...", 0.1)
         full_text, lang_code, _ = tr.transcribe_only(
             audio_path=input_path,
             progress_cb=lambda msg: log_progress(msg),
+            model_size=str(whisper_size or "base"),
         )
         if not full_text:
             raise gr.Error("Could not extract text from input audio.")
         log_progress(f"Synthesizing with Chatterbox TTS (lang={lang_code})...", 0.5)
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-            out_path = tmp.name
+        tmp_out = _write_wav_empty()
         try:
             chatterbox_engine.synthesize(
-                text=full_text,
-                language=lang_code,
-                ref_audio_path=ref_path,
-                output_path=out_path,
+                text=full_text, language=lang_code, ref_audio_path=ref_path,
+                output_path=tmp_out,
                 exaggeration=float(cb_exaggeration),
                 cfg_weight=float(cb_cfg_weight),
             )
         except Exception as e:
-            Path(out_path).unlink(missing_ok=True)
+            Path(tmp_out).unlink(missing_ok=True)
             raise gr.Error(f"Chatterbox TTS failed: {e}") from e
-        log_progress("Done.", 1.0)
-        return out_path
+        import soundfile as sf
+
+        arr, sr = sf.read(tmp_out, dtype="float32", always_2d=False)
+        Path(tmp_out).unlink(missing_ok=True)
+        if arr.ndim == 2:
+            arr = arr.mean(axis=1)
+        candidates.append((arr, int(sr)))
 
     else:  # OpenVoice
         if not openvoice_available():
             raise gr.Error("OpenVoice is not installed. Run: pip install openvoice-cli")
-        log_progress("Starting OpenVoice conversion (chunked to reduce VRAM)...", 0.0)
+        log_progress("Starting OpenVoice conversion (chunked to reduce VRAM)...", 0.1)
         try:
-            out_path = openvoice_convert(
-                input_path=input_path,
-                ref_path=ref_path,
-                output_path=None,
-                device=None,
-                tau=float(tau),
-                temperature=float(temperature),
-                chunk_duration_sec=18,
+            ov_path = openvoice_convert(
+                input_path=input_path, ref_path=ref_path,
+                output_path=None, device=None,
+                tau=float(tau), temperature=float(temperature),
+                chunk_duration_sec=_RUNTIME["openvoice_chunk_sec"],
                 progress_cb=log_progress,
                 use_cpu_fallback_on_oom=True,
             )
         except Exception as e:
             raise gr.Error(f"OpenVoice conversion failed: {e}") from e
-        log_progress("Done.", 1.0)
-        return out_path
+        import soundfile as sf
+
+        arr, sr = sf.read(ov_path, dtype="float32", always_2d=False)
+        if arr.ndim == 2:
+            arr = arr.mean(axis=1)
+        candidates.append((arr, int(sr)))
+
+    if not candidates:
+        raise gr.Error("All candidates failed — no audio produced.")
+
+    # ── Pick best candidate by speaker similarity ─────────────────────────
+    if len(candidates) > 1:
+        log_progress(f"Scoring {len(candidates)} candidates by speaker similarity...", 0.75)
+        best_idx, best_score = 0, -1.0
+        scores: list[float] = []
+        for i, (arr, sr) in enumerate(candidates):
+            s, _ = _similarity_label(ref_path, arr, sr)
+            scores.append(s)
+            if s > best_score:
+                best_score, best_idx = s, i
+        log_progress(f"Candidate scores: {['%.2f' % x for x in scores]}; picked #{best_idx+1}")
+        arr, sr = candidates[best_idx]
+    else:
+        arr, sr = candidates[0]
+
+    # ── Optional OpenVoice tone-color post-step ───────────────────────────
+    if apply_openvoice_post and openvoice_available() and engine_used != "OpenVoice":
+        log_progress("Applying OpenVoice tone-color post-step...", 0.85)
+        src_wav = _write_wav(arr, sr)
+        try:
+            post_path = openvoice_convert(
+                input_path=src_wav, ref_path=ref_path,
+                output_path=None, device=None,
+                tau=0.55, temperature=1.0,
+                chunk_duration_sec=_RUNTIME["openvoice_chunk_sec"],
+                progress_cb=lambda msg, _p=None: log_progress(msg),
+                use_cpu_fallback_on_oom=True,
+            )
+            import soundfile as sf
+
+            arr2, sr2 = sf.read(post_path, dtype="float32", always_2d=False)
+            if arr2.ndim == 2:
+                arr2 = arr2.mean(axis=1)
+            arr, sr = arr2, int(sr2)
+        except Exception as e:
+            log_progress(f"OpenVoice post-step failed ({e}) — keeping base output.")
+        finally:
+            Path(src_wav).unlink(missing_ok=True)
+
+    final_path = _write_wav(arr, sr)
+    score, sim_label = _similarity_label(ref_path, arr, sr)
+
+    # Aggressive VRAM reclaim in --low-vram mode.
+    if _RUNTIME.get("low_vram"):
+        try:
+            import device_utils
+
+            device_utils.unload_all()
+        except Exception as e:
+            print(f"[run_conversion] post-unload failed: {e}", flush=True)
+
+    log_progress(f"Done. {sim_label}", 1.0)
+    return final_path, sim_label
+
+
+def _write_wav_empty() -> str:
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+        return tmp.name
 
 
 def load_from_srt(srt_file):
@@ -330,6 +575,7 @@ def run_step2_synthesize(
                 input_path=tts_only_path,
                 ref_path=ref_path,
                 output_path=out_path,
+                chunk_duration_sec=_RUNTIME["openvoice_chunk_sec"],
                 progress_cb=lambda msg, _p=None: log(msg),
             )
             Path(tts_only_path).unlink(missing_ok=True)
@@ -357,15 +603,139 @@ def build_ui():
     with gr.Blocks(title="Voice Changer") as demo:
         gr.Markdown("# Voice Changer — Zero-Shot")
 
+        has_cb_tts = _has_chatterbox_tts()
+        has_cb_vc = _has_chatterbox_vc()
+        has_ov = bool(openvoice_available())
+        has_xtts = _has_xtts()
+        has_f5 = _has_f5tts()
+        has_bark = _has_bark()
+        has_seedvc = _has_seedvc()
+        has_ss = _has_speaker_sim()
+
         with gr.Tabs():
+            # ── Tab 0: Tagged TTS (text-only) ───────────────────────────────
+            with gr.Tab("Tagged TTS"):
+                gr.Markdown(
+                    "Wklej tekst (bez timestampów) z tagami typu `[śmiech]`, `[westchnienie]`, `[pauza]`.\n\n"
+                    "- **Mowa**: synteza przez wybrany silnik (Chatterbox/XTTS/F5/Edge).\n"
+                    "- **Tagi niewerbalne**: opcjonalnie Bark (lokalnie), żeby śmiech/westchnienie było w WAV.\n\n"
+                    "**Tip:** możesz też wgrać WAV i kliknąć „Transcribe sample → text”, żeby wypełnić pole tekstu."
+                )
+
+                with gr.Row():
+                    with gr.Column():
+                        tag_ref = gr.Audio(
+                            label="Reference Voice Sample (opcjonalnie — do klonowania głosu mowy)",
+                            type="filepath",
+                        )
+                        tag_transcribe_btn = gr.Button("Transcribe sample → text", variant="secondary")
+                        tag_text = gr.Textbox(
+                            label="Script (no timestamps)",
+                            lines=10,
+                            placeholder="No cześć [delikatny śmiech] miło cię widzieć.",
+                        )
+                        with gr.Row():
+                            speech_engine = gr.Dropdown(
+                                choices=["Chatterbox", "XTTS v2", "F5-TTS", "Edge-TTS"],
+                                value="Edge-TTS",
+                                label="Speech engine",
+                            )
+                            use_bark_tags = gr.Checkbox(
+                                value=False,
+                                label="Use Bark for non-speech tags ([śmiech]/[westchnienie]) — optional",
+                            )
+                        bark_preset = gr.Textbox(
+                            label="Bark preset (history_prompt)",
+                            value="v2/pl_speaker_0",
+                            info="Używane tylko do efektów tagów. Instalacja: pip install git+https://github.com/suno-ai/bark.git",
+                        )
+                        render_btn = gr.Button("Generate audio", variant="primary")
+
+                    with gr.Column():
+                        tag_out = gr.Audio(label="Output audio", type="numpy")
+
+                def _transcribe_ref(ref_audio, progress=gr.Progress()):
+                    ref_path = _audio_path(ref_audio)
+                    if not ref_path or not Path(ref_path).exists():
+                        raise gr.Error("Upload a WAV/MP3 first.")
+                    progress(0.1, desc="Transcribing with Whisper…")
+                    text, _lang, _dur = tr.transcribe_only(ref_path)
+                    progress(1.0, desc="Done.")
+                    return text
+
+                def _render_tagged(script, ref_audio, engine, bark_on, bark_hp, progress=gr.Progress()):
+                    script = script or ""
+                    ref_path = _audio_path(ref_audio)
+                    lang = "pl"
+                    progress(0.1, desc="Rendering…")
+                    speech = ("chatterbox" if engine == "Chatterbox" else
+                              "xtts" if engine == "XTTS v2" else
+                              "f5tts" if engine == "F5-TTS" else
+                              "edge")
+                    # Graceful fallback: if selected heavy backend is unavailable, use Edge-TTS.
+                    if speech == "chatterbox" and not has_cb_tts:
+                        progress(0.2, desc="Chatterbox unavailable → falling back to Edge-TTS")
+                        speech = "edge"
+                    elif speech == "xtts" and not has_xtts:
+                        progress(0.2, desc="XTTS unavailable → falling back to Edge-TTS")
+                        speech = "edge"
+                    elif speech == "f5tts" and not has_f5:
+                        progress(0.2, desc="F5-TTS unavailable → falling back to Edge-TTS")
+                        speech = "edge"
+
+                    if bark_on and not has_bark:
+                        progress(0.2, desc="Bark not installed → rendering without non-speech Bark tags")
+                        bark_on = False
+                    try:
+                        wav = tagged_tts.render_tagged_script(
+                            script,
+                            speech_engine=speech,
+                            language=lang,
+                            ref_audio_path=ref_path,
+                            use_bark_for_tags=bool(bark_on),
+                            bark_preset=bark_hp or "v2/pl_speaker_0",
+                        )
+                    except RuntimeError as e:
+                        # Friendly guidance instead of a red "Error" box
+                        raise gr.Error(str(e)) from e
+                    progress(1.0, desc="Done.")
+                    return (SAMPLE_RATE, wav)
+
+                tag_transcribe_btn.click(
+                    fn=_transcribe_ref,
+                    inputs=[tag_ref],
+                    outputs=[tag_text],
+                )
+                render_btn.click(
+                    fn=_render_tagged,
+                    inputs=[tag_text, tag_ref, speech_engine, use_bark_tags, bark_preset],
+                    outputs=[tag_out],
+                )
+
             # ── Tab 1: Voice Conversion ──────────────────────────────────────
             with gr.Tab("Voice Conversion"):
                 gr.Markdown(
-                    "Skonwertuj głos z nagrania wejściowego na głos z próbki referencyjnej. "
-                    "Trzy tryby: **Chatterbox VC** (resynteza przez S3), "
-                    "**Chatterbox TTS** (transkrypcja → TTS z klonowaniem głosu), "
-                    "**OpenVoice** (transfer tonu)."
+                    "Skonwertuj głos z nagrania wejściowego na głos z próbki referencyjnej.\n\n"
+                    "**Tryby:** **Chatterbox VC** (resynteza przez tokenizer S3, zachowuje prozodię), "
+                    "**Seed-VC** (SOTA zero-shot identity transfer), "
+                    "**OpenVoice** (transfer tonu), "
+                    "**Chatterbox TTS** (transkrypcja → TTS z klonowaniem głosu — traci prozodię)."
                 )
+                if not (has_cb_vc or has_cb_tts or has_ov or has_seedvc):
+                    gr.Markdown(
+                        "⚠️ **Brak dostępnych backendów Voice Conversion w tym środowisku.**\n\n"
+                        "- Chatterbox: `pip install chatterbox-tts`\n"
+                        "- Seed-VC: `pip install seed-vc`\n"
+                        "- OpenVoice: `pip install openvoice-cli`"
+                    )
+                _vc_choices = [c for c, ok in [
+                    ("Chatterbox VC", has_cb_vc),
+                    ("Seed-VC", has_seedvc),
+                    ("OpenVoice", has_ov),
+                    ("Chatterbox TTS", has_cb_tts),
+                ] if ok] or ["Chatterbox VC"]
+                _vc_default = _vc_choices[0]
+
                 with gr.Row():
                     with gr.Column():
                         vc_input = gr.Audio(label="Input Audio", type="filepath")
@@ -373,18 +743,26 @@ def build_ui():
                             label="Reference Voice Sample (5–30 s)", type="filepath"
                         )
                         vc_model_radio = gr.Radio(
-                            choices=["Chatterbox VC", "Chatterbox TTS", "OpenVoice"],
-                            value="Chatterbox VC",
+                            choices=_vc_choices,
+                            value=_vc_default,
                             label="Conversion Model",
                         )
-                        with gr.Group(visible=True) as vc_group_chatterbox_vc:
+                        with gr.Group(visible=(_vc_default == "Chatterbox VC")) as vc_group_chatterbox_vc:
                             gr.Markdown(
                                 "**Chatterbox VC** — resyntezuje audio zachowując treść, "
                                 "aplikując tembr głosu z próbki referencyjnej (tokenizer S3). "
-                                "Brak dodatkowych parametrów."
+                                "Stochastyczny → best-of-N pomaga."
                             )
-                        with gr.Group(visible=False) as vc_group_chatterbox_tts:
-                            gr.Markdown("**Chatterbox TTS** — transkrypcja Whisper → synteza TTS z klonowaniem głosu")
+                        with gr.Group(visible=(_vc_default == "Seed-VC")) as vc_group_seedvc:
+                            gr.Markdown(
+                                "**Seed-VC** — SOTA zero-shot VC z silnym transferem tożsamości. "
+                                "Dobrze reaguje na `best-of-N` (różny seed)."
+                            )
+                        with gr.Group(visible=(_vc_default == "Chatterbox TTS")) as vc_group_chatterbox_tts:
+                            gr.Markdown(
+                                "**Chatterbox TTS** — transkrypcja Whisper → synteza TTS z klonowaniem głosu. "
+                                "Uwaga: traci prozodię źródła."
+                            )
                             vc_cb_exaggeration = gr.Slider(
                                 minimum=0.0, maximum=1.0, value=0.5, step=0.05,
                                 label="Emotion exaggeration",
@@ -395,7 +773,14 @@ def build_ui():
                                 label="CFG weight (guidance)",
                                 info="Higher = more faithful to reference voice.",
                             )
-                        with gr.Group(visible=False) as vc_group_openvoice:
+                            vc_whisper_size = gr.Dropdown(
+                                choices=["base", "small", "medium", "large-v2", "large-v3"],
+                                value="base",
+                                label="Whisper model size",
+                                info="Większy model = lepsza transkrypcja źródła → lepsza re-synteza. "
+                                     "`large-v3` wymaga GPU dla rozsądnego czasu.",
+                            )
+                        with gr.Group(visible=(_vc_default == "OpenVoice")) as vc_group_openvoice:
                             gr.Markdown("**OpenVoice settings**")
                             vc_tau = gr.Slider(
                                 minimum=0.3, maximum=1.0, value=0.65, step=0.05,
@@ -407,21 +792,79 @@ def build_ui():
                                 label="Voice temperature",
                                 info="Higher = warmer, more expressive; lower = calmer.",
                             )
+
+                        with gr.Accordion("Advanced (reference preprocessing, best-of-N, post)", open=False):
+                            vc_preprocess = gr.Checkbox(
+                                value=True,
+                                label="Preprocess reference (denoise / LUFS / VAD / best-window)",
+                                info="Włączone zalecane. Wynik jest cache’owany obok pliku referencyjnego.",
+                            )
+                            vc_denoise = gr.Checkbox(
+                                value=True,
+                                label="Denoise reference (noisereduce)",
+                                info="Usuń szum tła z próbki (wymaga `pip install noisereduce`).",
+                            )
+                            vc_best_of_n = gr.Slider(
+                                minimum=1, maximum=5, value=(3 if has_ss else 1), step=1,
+                                label="Best-of-N candidates",
+                                info=(
+                                    "Liczba prób (Chatterbox VC / Seed-VC losują). "
+                                    "Najlepsza wybierana po podobieństwie mówcy." if has_ss else
+                                    "Similarity nieaktywne (brak speechbrain/resemblyzer) → >1 nie przyniesie poprawy."
+                                ),
+                            )
+                            vc_apply_ov_post = gr.Checkbox(
+                                value=False,
+                                label="Apply OpenVoice tone-color as post-step",
+                                info="Dodatkowy transfer tonu po głównej konwersji (wymaga OpenVoice).",
+                                visible=has_ov,
+                            )
+
+                        if not has_ss:
+                            gr.Markdown(
+                                "ℹ️ Pomiar podobieństwa mówcy niedostępny — `pip install speechbrain` "
+                                "lub `pip install resemblyzer`, żeby włączyć scoring i best-of-N."
+                            )
+
                         vc_btn = gr.Button("Convert Voice", variant="primary")
                     with gr.Column():
                         vc_output = gr.Audio(label="Converted Audio", type="filepath")
+                        vc_similarity = gr.Textbox(
+                            label="Speaker similarity",
+                            value="",
+                            interactive=False,
+                            info=">=0.72 = dobry klon, 0.60–0.72 = akceptowalny, <0.55 = słaby (zmień referencję).",
+                        )
 
                 def _update_vc_model_ui(model):
                     return (
                         gr.update(visible=model == "Chatterbox VC"),
+                        gr.update(visible=model == "Seed-VC"),
                         gr.update(visible=model == "Chatterbox TTS"),
                         gr.update(visible=model == "OpenVoice"),
                     )
 
+                def _on_model_change(model):
+                    """Free VRAM of the previously-active VC engine."""
+                    try:
+                        import device_utils
+
+                        keep_map = {
+                            "Chatterbox VC":  ("chatterbox_engine",),
+                            "Chatterbox TTS": ("chatterbox_engine",),
+                            "Seed-VC":        ("seed_vc_engine",),
+                            "OpenVoice":      ("openvoice_engine",),
+                        }
+                        device_utils.unload_all(except_modules=keep_map.get(model, ()))
+                    except Exception as e:
+                        print(f"[vc_model_radio.change] unload_all failed: {e}", flush=True)
+                    return _update_vc_model_ui(model)
+
                 vc_model_radio.change(
-                    fn=_update_vc_model_ui,
+                    fn=_on_model_change,
                     inputs=[vc_model_radio],
-                    outputs=[vc_group_chatterbox_vc, vc_group_chatterbox_tts, vc_group_openvoice],
+                    outputs=[vc_group_chatterbox_vc, vc_group_seedvc,
+                             vc_group_chatterbox_tts, vc_group_openvoice],
                 )
                 vc_btn.click(
                     fn=run_conversion,
@@ -429,14 +872,15 @@ def build_ui():
                         vc_input, vc_ref, vc_model_radio,
                         vc_cb_exaggeration, vc_cb_cfg,
                         vc_tau, vc_temperature,
+                        vc_preprocess, vc_denoise, vc_best_of_n, vc_apply_ov_post,
+                        vc_whisper_size,
                     ],
-                    outputs=[vc_output],
+                    outputs=[vc_output, vc_similarity],
                 )
                 gr.Markdown(
-                    "**Tips:** Use 5–30 s of clean reference speech. "
-                    "Chatterbox VC/TTS download weights on first use. "
-                    "Chatterbox TTS transcribes the input audio first, then re-synthesizes in the reference voice. "
-                    "OpenVoice requires: `pip install openvoice-cli`."
+                    "**Tips:** Referencja 15–25 s, czysta mowa, jeden głos. "
+                    "Najlepsza jakość klonu: **Chatterbox VC** lub **Seed-VC** z preprocessingiem i best-of-N=3. "
+                    "Włącz „Apply OpenVoice post”, jeśli chcesz dodatkowo dociągnąć tembr."
                 )
 
             # ── Tab 2: Translate & Convert ───────────────────────────────────
@@ -503,7 +947,7 @@ def build_ui():
                         gr.Markdown("### Step 2 — Synthesize & Convert")
                         tr_tts_backend = gr.Radio(
                             choices=["Edge-TTS + OpenVoice", "XTTS v2", "Chatterbox", "F5-TTS"],
-                            value="Chatterbox",
+                            value=("Chatterbox" if has_cb_tts else "Edge-TTS + OpenVoice"),
                             label="TTS Engine",
                             info=(
                                 "Chatterbox: najlepsza jakość, natywny polski, MIT. "
@@ -639,16 +1083,30 @@ def main():
     parser.add_argument("--host", default="127.0.0.1", help="Host to bind to")
     parser.add_argument(
         "--low-vram", action="store_true",
-        help="Reduce GPU chunk sizes to avoid OOM on cards with <8 GB VRAM "
-             "(feature chunks: 5s, vocoder chunks: 300 frames)",
+        help="Reduce GPU memory use: kNN-VC / WavLM chunks, smaller OpenVoice time chunks (~10 s).",
+    )
+    parser.add_argument(
+        "--cpu",
+        action="store_true",
+        help="Do not use NVIDIA GPUs (CUDA hidden). Chatterbox/OpenVoice run on CPU — slower, no VRAM errors.",
     )
     args = parser.parse_args()
+
+    if args.cpu:
+        os.environ.setdefault("VOICE_CHANGER_FORCE_DEVICE", "cpu")
+        print("CPU mode: CUDA disabled for this process (--cpu).")
 
     if args.low_vram:
         import voice_utils
         voice_utils.CHUNK_SECONDS = 5
         voice_utils.MATCH_CHUNK_FRAMES = 300
-        print("Low-VRAM mode: feature chunks=5s, vocoder chunks=300 frames (~6s)")
+        _RUNTIME["openvoice_chunk_sec"] = min(10.0, float(_OV_DEFAULT_CHUNK_SEC))
+        _RUNTIME["low_vram"] = True
+        print(
+            "Low-VRAM mode: kNN feature chunks=5s, vocoder chunks=300 frames; "
+            f"OpenVoice chunk length={_RUNTIME['openvoice_chunk_sec']:.0f}s; "
+            "engines auto-unloaded after each conversion."
+        )
 
     # kNN-VC is loaded only when using "Translate & Convert" with reference (saves ~9.5 GB VRAM for OpenVoice in Tab 1)
 

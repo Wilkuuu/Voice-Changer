@@ -87,6 +87,49 @@ Options:
 - `--share`      — create public Gradio tunnel URL
 - `--host 0.0.0.0` — listen on all interfaces
 
+## Docker
+
+Pre-built `Dockerfile` + `docker-compose.yml` are included.
+
+Requirements on the host:
+
+- Docker Engine 25+ with Compose v2 (`docker compose version`)
+- For GPU: the NVIDIA driver **and** the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html) (`nvidia-ctk`). The image ships its own CUDA libraries — only the driver has to be present on the host.
+
+### GPU (default)
+
+```bash
+cp .env.example .env      # optional: set VC_PORT / HOST_AUDIO / ANTHROPIC_API_KEY
+docker compose up --build
+# open http://localhost:7862
+```
+
+Model downloads (Hugging Face, torch.hub, SpeechBrain, Argos Translate) are kept in named volumes, so they persist across `docker compose down`.
+
+### CPU only
+
+```bash
+docker compose --profile cpu up --build app-cpu
+```
+
+### Custom input directory
+
+By default `./data` on the host is mounted as `/data` in the container (read-write, so `ref_preprocess` can write its sidecar cache). Point the Gradio "input audio" / "reference" pickers there, or override via `HOST_AUDIO` in `.env`:
+
+```bash
+HOST_AUDIO=/media/wilk/PV1/pv/AUDIO docker compose up
+```
+
+### Useful overrides
+
+```bash
+# disable --low-vram:
+docker compose run --rm app python app.py --host 0.0.0.0 --port 7862
+
+# public Gradio tunnel:
+docker compose run --rm -p 7862:7862 app python app.py --host 0.0.0.0 --port 7862 --share
+```
+
 ## How it works
 
 1. HuBERT extracts frame-level speech features from the **input** audio

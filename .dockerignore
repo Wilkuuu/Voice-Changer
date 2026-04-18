@@ -1,0 +1,49 @@
+# Keep build context small — everything heavy/local stays on the host.
+.git
+.gitignore
+.venv
+venv
+__pycache__
+**/__pycache__
+*.pyc
+*.pyo
+*.pyd
+.mypy_cache
+.pytest_cache
+.ruff_cache
+.ipynb_checkpoints
+
+# Local data / artifacts
+data/
+processed/
+outputs/
+tmp/
+*.wav
+*.mp3
+*.flac
+*.m4a
+*.ogg
+*.opus
+
+# Model caches accidentally left in the repo
+*.pt
+*.pth
+*.bin
+*.safetensors
+*.onnx
+
+# IDE / OS
+.DS_Store
+.idea
+.vscode
+*.swp
+
+# Docker meta
+Dockerfile
+docker-compose*.yml
+.dockerignore
+
+# Secrets / env
+.env
+.env.*
+!.env.example
