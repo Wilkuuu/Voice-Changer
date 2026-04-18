@@ -12,11 +12,15 @@ engines in this project:
         -> (output_path_or_None, wav_float32, sample_rate)
     unload()
 
-Seed-VC ships a CLI (``seed-vc``) plus a ``seed_vc.inference`` module. Both
-entry points historically change between releases, so we probe several
-candidates and fall back to the CLI binary when the Python API is not
-available. If nothing is installed, ``is_available()`` returns ``False`` and
-``get_model()`` raises a friendly error — the UI falls back to another engine.
+The PyPI wheel (e.g. ``seed_vc`` 0.4.x) exposes ``seed_vc.inference`` with
+``load_models(args)`` and ``main(args)``. That module also does
+``from .modules.commons import *``, which re-exports ``build_model`` — it is
+**not** a top-level factory; calling it without ``(model_params, stage)``
+raises misleading errors. We therefore never probe ``build_model`` on the
+inference module; instead we patch ``load_models`` to cache weights and call
+``main()`` per conversion.
+
+Official console scripts use names like ``seed-vc-infer-v1``, not ``seed-vc``.
 
 Install:
     pip install seed-vc
@@ -26,11 +30,15 @@ Install:
 from __future__ import annotations
 
 import importlib
+import importlib.util
+import random
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Optional
 
 import numpy as np
@@ -39,69 +47,216 @@ from device_utils import empty_cache as _empty_cache, select_device as _select_d
 
 _model: Any = None
 _device: Optional[str] = None
-_backend: Optional[str] = None  # "python" | "cli"
+_backend: Optional[str] = None  # "python_seed_v1" | "cli_exe" | "cli_pymod"
+
+_seed_infer_module: Any = None
+_seed_infer_original_load_models: Any = None
+_seed_infer_bundle_cache: dict[str, Any] = {"b": None}
+
+_main_lock = threading.Lock()
 
 
 def _log(msg: str) -> None:
     print(f"[Seed-VC] {msg}", flush=True)
 
 
-def _probe_python_backend() -> Optional[str]:
-    """Return the importable module path if a Python backend exists."""
-    for mod_name in ("seed_vc.inference", "seed_vc.api", "seed_vc"):
+def _prepare_seed_hf_cache() -> None:
+    """``seed_vc.inference`` sets HF_HUB_CACHE on import; point it under XDG_CACHE_HOME."""
+    import os
+
+    hub = os.path.join(
+        os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache")),
+        "seed_vc",
+        "hf_hub",
+    )
+    os.makedirs(hub, exist_ok=True)
+    os.environ["HF_HUB_CACHE"] = hub
+
+
+def _patch_seed_inference_load_models(mod: Any) -> None:
+    """Cache the heavy tuple returned by ``load_models`` — ``main()`` calls it every time."""
+    global _seed_infer_module, _seed_infer_original_load_models
+    if _seed_infer_module is mod:
+        return
+    _seed_infer_original_load_models = mod.load_models
+    _seed_infer_module = mod
+
+    def _cached_load_models(args: Any) -> Any:
+        if _seed_infer_bundle_cache["b"] is None:
+            _seed_infer_bundle_cache["b"] = _seed_infer_original_load_models(args)
+        return _seed_infer_bundle_cache["b"]
+
+    mod.load_models = _cached_load_models
+
+
+def _unpatch_seed_inference() -> None:
+    global _seed_infer_module, _seed_infer_original_load_models
+    if _seed_infer_module is not None and _seed_infer_original_load_models is not None:
         try:
-            importlib.import_module(mod_name)
-            return mod_name
+            _seed_infer_module.load_models = _seed_infer_original_load_models
         except Exception:
-            continue
-    return None
+            pass
+    _seed_infer_module = None
+    _seed_infer_original_load_models = None
+    _seed_infer_bundle_cache["b"] = None
 
 
-def _probe_cli_backend() -> Optional[str]:
-    """Return path to seed-vc binary if installed."""
-    for name in ("seed-vc", "seedvc"):
-        p = shutil.which(name)
-        if p:
-            return p
-    return None
+def _spec_seed_inference() -> Any:
+    return importlib.util.find_spec("seed_vc.inference")
 
 
 def is_available() -> bool:
-    return bool(_probe_python_backend() or _probe_cli_backend())
+    if _spec_seed_inference() is not None:
+        return True
+    if shutil.which("seed-vc-infer-v1") or shutil.which("seed-vc-infer-v2"):
+        return True
+    return False
 
 
-def _load_python_model(mod_name: str):
-    """Instantiate the Seed-VC model from its Python API, best-effort."""
-    mod = importlib.import_module(mod_name)
-    device = _select_device()
-
-    for attr in ("SeedVC", "VoiceConversionModel", "VoiceConverter"):
-        cls = getattr(mod, attr, None)
-        if cls is None:
-            continue
-        try:
-            if hasattr(cls, "from_pretrained"):
-                return cls.from_pretrained(device=device), device
-            return cls(device=device), device
-        except TypeError:
-            try:
-                return cls(), device
-            except Exception:
-                continue
-        except Exception:
-            continue
-
-    for fn_name in ("load_model", "build_model"):
-        fn = getattr(mod, fn_name, None)
-        if callable(fn):
-            try:
-                return fn(device=device), device
-            except TypeError:
-                return fn(), device
-    raise RuntimeError(
-        "Seed-VC Python module is installed but no known entry point could be "
-        "called. Upgrade seed-vc or use the CLI (``pip install seed-vc[cli]``)."
+def _v1_main_args(source: str, target: str, out_dir: str) -> Any:
+    """Namespace compatible with ``seed_vc.inference.main`` + ``load_models``."""
+    dev = _select_device()
+    return SimpleNamespace(
+        source=str(source),
+        target=str(target),
+        output=str(out_dir),
+        diffusion_steps=30,
+        length_adjust=1.0,
+        inference_cfg_rate=0.7,
+        f0_condition=False,
+        auto_f0_adjust=False,
+        semi_tone_shift=0,
+        checkpoint=None,
+        config=None,
+        fp16=dev == "cuda",
     )
+
+
+def _run_seed_v1_inference_main(mod: Any, input_path: str, ref_path: str, seed: Optional[int]) -> tuple[np.ndarray, int]:
+    """Call ``seed_vc.inference.main`` once; models stay cached via patched ``load_models``."""
+    import torch
+    import soundfile as sf
+
+    if seed is not None:
+        s = int(seed)
+        torch.manual_seed(s)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(s)
+        random.seed(s)
+        np.random.seed(s)
+
+    out_dir = tempfile.mkdtemp(prefix="seedvc_main_")
+    try:
+        args = _v1_main_args(input_path, ref_path, out_dir)
+        with _main_lock:
+            mod.main(args)
+        outs = sorted(Path(out_dir).glob("vc_*.wav"), key=lambda p: p.stat().st_mtime)
+        if not outs:
+            raise RuntimeError("seed_vc.inference produced no vc_*.wav in output directory.")
+        fp = outs[-1]
+        arr, sr = sf.read(str(fp), dtype="float32", always_2d=False)
+        if arr.ndim == 2:
+            arr = arr.mean(axis=1)
+        return arr.astype(np.float32), int(sr)
+    finally:
+        shutil.rmtree(out_dir, ignore_errors=True)
+
+
+def _cli_cmd_v1(argv0: str, out_dir: str, input_path: str, ref_path: str) -> list[str]:
+    dev = _select_device()
+    fp16s = "true" if dev == "cuda" else "false"
+    tail = [
+        "--source",
+        str(input_path),
+        "--target",
+        str(ref_path),
+        "--output",
+        str(out_dir),
+        "--diffusion-steps",
+        "30",
+        "--length-adjust",
+        "1.0",
+        "--inference-cfg-rate",
+        "0.7",
+        "--f0-condition",
+        "false",
+        "--auto-f0-adjust",
+        "false",
+        "--semi-tone-shift",
+        "0",
+        "--fp16",
+        fp16s,
+    ]
+    if argv0 == "PYMOD":
+        return [sys.executable, "-m", "seed_vc.inference", *tail]
+    return [argv0, *tail]
+
+
+def _cli_cmd_v2(exe: str, out_dir: str, input_path: str, ref_path: str) -> list[str]:
+    return [
+        exe,
+        "--source",
+        str(input_path),
+        "--target",
+        str(ref_path),
+        "--output",
+        str(out_dir),
+        "--diffusion-steps",
+        "30",
+        "--length-adjust",
+        "1.0",
+        "--intelligibility-cfg-rate",
+        "0.7",
+        "--similarity-cfg-rate",
+        "0.7",
+        "--top-p",
+        "0.9",
+        "--temperature",
+        "1.0",
+        "--repetition-penalty",
+        "1.0",
+        "--convert-style",
+        "false",
+        "--anonymization-only",
+        "false",
+    ]
+
+
+def _run_cli_infer(argv0: str, input_path: str, ref_path: str, seed: Optional[int]) -> tuple[np.ndarray, int]:
+    import torch
+    import soundfile as sf
+
+    if seed is not None:
+        s = int(seed)
+        torch.manual_seed(s)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(s)
+        random.seed(s)
+        np.random.seed(s)
+
+    out_dir = tempfile.mkdtemp(prefix="seedvc_cli_")
+    try:
+        if isinstance(argv0, tuple) and len(argv0) == 2 and argv0[0] == "v2":
+            cmd = _cli_cmd_v2(argv0[1], out_dir, input_path, ref_path)
+            glob_pat = "vc_v2_*.wav"
+        else:
+            cmd = _cli_cmd_v1(argv0, out_dir, input_path, ref_path)
+            glob_pat = "vc_*.wav"
+        _log("CLI: " + " ".join(cmd))
+        res = subprocess.run(cmd, capture_output=True, text=True)
+        if res.returncode != 0:
+            tail = (res.stderr or res.stdout or "")[-4000:]
+            raise RuntimeError(f"seed-vc CLI exited with code {res.returncode}\n{tail}")
+        outs = sorted(Path(out_dir).glob(glob_pat), key=lambda p: p.stat().st_mtime)
+        if not outs:
+            raise RuntimeError(f"CLI produced no {glob_pat} in output directory.")
+        fp = outs[-1]
+        arr, sr = sf.read(str(fp), dtype="float32", always_2d=False)
+        if arr.ndim == 2:
+            arr = arr.mean(axis=1)
+        return arr.astype(np.float32), int(sr)
+    finally:
+        shutil.rmtree(out_dir, ignore_errors=True)
 
 
 def get_model():
@@ -109,103 +264,48 @@ def get_model():
     if _model is not None:
         return _model
 
-    mod_name = _probe_python_backend()
-    if mod_name is not None:
+    dev = _select_device()
+
+    if _spec_seed_inference() is not None:
         try:
-            _log(f"loading Python backend via {mod_name}...")
-            _model, _device = _load_python_model(mod_name)
-            _backend = "python"
-            _log(f"ready on {_device}.")
+            _log("loading seed_vc.inference (in-process, cached load_models)...")
+            mod = importlib.import_module("seed_vc.inference")
+            _prepare_seed_hf_cache()
+            _patch_seed_inference_load_models(mod)
+            _model = mod
+            _device = dev
+            _backend = "python_seed_v1"
+            _log(f"ready ({_backend}) on {_device}.")
             return _model
         except Exception as e:
-            _log(f"Python backend load failed ({e}). Falling back to CLI.")
+            _log(f"in-process seed_vc.inference failed ({e}); will try CLI.")
 
-    cli = _probe_cli_backend()
-    if cli is not None:
-        _backend = "cli"
-        _model = cli
-        _device = _select_device()
-        _log(f"using CLI backend at {cli} ({_device}).")
+    p1 = shutil.which("seed-vc-infer-v1")
+    if p1:
+        _model = p1
+        _device = dev
+        _backend = "cli_exe"
+        _log(f"using CLI backend at {p1}")
+        return _model
+    p2 = shutil.which("seed-vc-infer-v2")
+    if p2:
+        _model = ("v2", p2)
+        _device = dev
+        _backend = "cli_exe"
+        _log(f"using CLI backend (v2) at {p2}")
+        return _model
+
+    if _spec_seed_inference() is not None:
+        _model = "PYMOD"
+        _device = dev
+        _backend = "cli_pymod"
+        _log("using subprocess: python -m seed_vc.inference")
         return _model
 
     raise RuntimeError(
         "Seed-VC is not installed. Install with: pip install seed-vc "
         "(or: pip install git+https://github.com/Plachtaa/seed-vc)."
     )
-
-
-def _run_cli(input_path: str, ref_path: str, output_path: str, seed: Optional[int]) -> int:
-    """Invoke the seed-vc CLI; returns the process exit code."""
-    cli = _probe_cli_backend()
-    if cli is None:
-        raise RuntimeError("seed-vc CLI not found on PATH.")
-    cmd = [
-        cli,
-        "--source", str(input_path),
-        "--target", str(ref_path),
-        "--output", str(output_path),
-    ]
-    if seed is not None:
-        cmd += ["--seed", str(int(seed))]
-    _log("CLI: " + " ".join(cmd))
-    res = subprocess.run(cmd, check=False)
-    return res.returncode
-
-
-def _run_python(model: Any, input_path: str, ref_path: str, seed: Optional[int]) -> tuple[np.ndarray, int]:
-    """Call the Python API with a best-effort kwargs mapping."""
-    import torch
-
-    if seed is not None:
-        torch.manual_seed(int(seed))
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(int(seed))
-
-    candidates = [
-        dict(source=input_path, target=ref_path),
-        dict(source_path=input_path, target_path=ref_path),
-        dict(audio=input_path, target_voice_path=ref_path),
-        dict(src=input_path, ref=ref_path),
-    ]
-    method_names = ("convert", "inference", "run", "generate", "__call__")
-    last_err: Exception | None = None
-    for method_name in method_names:
-        method = getattr(model, method_name, None)
-        if not callable(method):
-            continue
-        for kwargs in candidates:
-            try:
-                out = method(**kwargs)
-                return _coerce_audio(out, model)
-            except TypeError as e:
-                last_err = e
-                continue
-            except Exception as e:
-                last_err = e
-                continue
-    raise RuntimeError(f"Seed-VC Python API call failed: {last_err}")
-
-
-def _coerce_audio(out: Any, model: Any) -> tuple[np.ndarray, int]:
-    """Normalize Seed-VC return values to (float32 mono array, sr)."""
-    import torch
-
-    if isinstance(out, tuple) and len(out) >= 2:
-        wav, sr = out[0], out[1]
-    elif isinstance(out, dict):
-        wav = out.get("wav") or out.get("audio") or out.get("waveform")
-        sr = out.get("sr") or out.get("sample_rate") or getattr(model, "sr", 24000)
-    else:
-        wav = out
-        sr = getattr(model, "sr", 24000)
-    if isinstance(wav, torch.Tensor):
-        arr = wav.detach().cpu().numpy()
-    else:
-        arr = np.asarray(wav)
-    arr = arr.astype(np.float32)
-    if arr.ndim == 2:
-        arr = arr.mean(axis=0)
-    return arr, int(sr)
 
 
 def convert_voice(
@@ -219,30 +319,26 @@ def convert_voice(
 
     Returns ``(output_path_or_None, wav_float32_mono, sample_rate)``.
     """
-    model = get_model()
+    get_model()
 
-    if _backend == "cli":
-        tmp_out = output_path
-        if tmp_out is None:
-            fd = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
-            tmp_out = fd.name
-            fd.close()
-        code = _run_cli(str(input_path), str(ref_path), str(tmp_out), seed)
-        if code != 0:
-            raise RuntimeError(f"seed-vc CLI exited with code {code}")
-        import soundfile as sf
+    if _backend == "python_seed_v1":
+        arr, sr = _run_seed_v1_inference_main(_model, str(input_path), str(ref_path), seed)
+    elif _backend in ("cli_exe", "cli_pymod"):
+        if _model == "PYMOD":
+            argv0 = "PYMOD"
+        elif isinstance(_model, tuple) and _model[0] == "v2":
+            argv0 = _model  # ("v2", path)
+        else:
+            argv0 = str(_model)
+        arr, sr = _run_cli_infer(argv0, str(input_path), str(ref_path), seed)
+    else:
+        raise RuntimeError(f"Unknown Seed-VC backend: {_backend!r}")
 
-        arr, sr = sf.read(tmp_out, dtype="float32", always_2d=False)
-        if arr.ndim == 2:
-            arr = arr.mean(axis=1).astype(np.float32)
-        return (output_path, arr.astype(np.float32), int(sr))
-
-    arr, sr = _run_python(model, str(input_path), str(ref_path), seed)
     if output_path is not None:
         import soundfile as sf
 
         sf.write(output_path, arr, sr)
-    return (output_path, arr, int(sr))
+    return (output_path, arr, sr)
 
 
 def unload() -> None:
@@ -250,11 +346,14 @@ def unload() -> None:
     if _model is None:
         return
     try:
-        if _backend == "python":
+        if _backend == "python_seed_v1":
+            _unpatch_seed_inference()
             try:
                 del _model
             except Exception:
                 pass
+        elif _backend in ("cli_exe", "cli_pymod"):
+            pass
     finally:
         _model = None
         _backend = None
