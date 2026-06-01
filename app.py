@@ -217,6 +217,83 @@ def _prepared_ref_path(ref_path: str, preprocess: bool, denoise: bool) -> tuple[
         return ref_path, f"reference: raw (preprocess failed: {e})"
 
 
+def run_prepare_reference(
+    source_audio,
+    target_seconds: float,
+    denoise: bool,
+    use_cache: bool,
+    progress=gr.Progress(),
+):
+    """
+    Standalone tab: cut silence/noise, keep voiced speech, pick the cleanest window,
+    normalize loudness — write a ready-to-use reference WAV (24 kHz mono).
+    """
+    src_path = _audio_path(source_audio)
+    if not src_path or not Path(src_path).exists():
+        raise gr.Error("Wgraj plik audio (WAV, MP3, FLAC, OGG…).")
+
+    def log(msg: str, p: float | None = None) -> None:
+        print(f"[Prepare Reference] {msg}", flush=True)
+        if p is not None:
+            progress(float(p), desc=msg)
+        else:
+            progress(None, desc=msg)
+
+    log("Ładowanie audio…", 0.05)
+    try:
+        import ref_preprocess as rp
+    except ImportError as e:
+        raise gr.Error(
+            "Brak modułu ref_preprocess. Upewnij się, że uruchamiasz app z katalogu projektu."
+        ) from e
+
+    sec = float(target_seconds or 20.0)
+    sec = max(8.0, min(25.0, sec))
+
+    log("VAD, opcjonalny denoise, wybór najlepszego fragmentu…", 0.2)
+    try:
+        _, sr, meta = rp.prepare_reference(
+            src_path,
+            target_sr=24_000,
+            target_seconds=sec,
+            denoise=bool(denoise),
+            use_cache=bool(use_cache),
+        )
+    except Exception as e:
+        raise gr.Error(f"Nie udało się przygotować referencji: {e}") from e
+
+    out_path = Path(meta.cached_path)
+    if not out_path.exists():
+        raise gr.Error("Plik wyjściowy nie został zapisany — sprawdź uprawnienia do katalogu źródłowego.")
+
+    log("Gotowe.", 1.0)
+
+    src_dur_note = ""
+    try:
+        import librosa
+        src_dur = float(librosa.get_duration(path=src_path))
+        src_dur_note = f"- **Źródło (całość):** {src_dur:.1f} s\n"
+    except Exception:
+        pass
+
+    cache_note = " (z cache)" if meta.used_cache else ""
+    report = (
+        f"### Przygotowana referencja{cache_note}\n\n"
+        f"{src_dur_note}"
+        f"- **Wyjście:** `{out_path.name}`\n"
+        f"- **Długość:** {meta.duration_sec:.1f} s @ {meta.sr} Hz, mono\n"
+        f"- **Po VAD (łącznie mowy):** {meta.voiced_seconds:.1f} s\n"
+        f"- **Wybrane okno:** {meta.best_window_seconds:.1f} s\n"
+        f"- **Szac. SNR:** {meta.snr_db:.1f} dB\n"
+        f"- **Głośność:** {meta.loudness_lufs:.1f} LUFS\n"
+        f"- **Denoise:** {'tak' if meta.denoised else 'nie'}\n"
+        f"- **Pełna ścieżka:** `{out_path.resolve()}`\n\n"
+        "Użyj tego pliku jako **Reference Voice** w Voice Conversion lub Translate. "
+        "Zalecane 15–25 s czystej mowy jednego mówcy."
+    )
+    return str(out_path.resolve()), report
+
+
 def _similarity_label(ref_wav_path: str, out_arr, out_sr: int) -> tuple[float, str]:
     try:
         import speaker_sim
@@ -345,6 +422,30 @@ def run_conversion(
         )
         if not full_text:
             raise gr.Error("Could not extract text from input audio.")
+        # Free Whisper + other engines from VRAM so Chatterbox Multilingual
+        # (~6–8 GB) actually fits on the GPU. Without this, MTL OOMs and
+        # silently falls back to English-only, which then crashes with a
+        # CUDA device-side assert on non-English text.
+        log_progress("Freeing GPU memory before Chatterbox load...", 0.45)
+        try:
+            tr.unload_whisper()
+        except Exception as e:
+            print(f"[Voice Conversion] unload_whisper failed: {e}", flush=True)
+        try:
+            device_utils.unload_all(except_modules=("chatterbox_engine",))
+        except Exception as e:
+            print(f"[Voice Conversion] unload_all failed: {e}", flush=True)
+        try:
+            _cb_model = chatterbox_engine.get_model()
+        except Exception as e:
+            raise gr.Error(f"Chatterbox model failed to load: {e}") from e
+        if not getattr(_cb_model, "_is_multilingual", False) and (lang_code or "en").lower() != "en":
+            raise gr.Error(
+                f"Chatterbox loaded the English-only model and the detected language is '{lang_code}'. "
+                "Most likely cause: not enough free VRAM for the Multilingual model "
+                "(needs ~6–8 GB). Close other GPU apps, or run the app with `--low-vram`/`--cpu`, "
+                "or pick another TTS engine for non-English speech."
+            )
         log_progress(f"Synthesizing with Chatterbox TTS (lang={lang_code})...", 0.5)
         tmp_out = _write_wav_empty()
         try:
@@ -517,131 +618,166 @@ def run_step2_synthesize(
     chatterbox_exaggeration, chatterbox_cfg_weight,
     f5tts_ref_text, f5tts_model_path, f5tts_speed,
     input_audio_path,
+    preprocess_reference: bool = True,
     progress=gr.Progress(),
 ):
     """Tab 2 Step 2: TTS + optional voice conversion from edited segments."""
     if not edited_text or not edited_text.strip():
         raise gr.Error("No segments to synthesize. Run Step 1 first.")
-    if total_duration == 0:
-        raise gr.Error("Missing audio duration. Run Step 1 first.")
+    total_duration = float(total_duration or 0)
+    if total_duration <= 0:
+        total_duration = tr.infer_duration_from_segments(edited_text)
+    if total_duration <= 0:
+        raise gr.Error(
+            "Missing audio duration. Run Step 1 first, or use segment lines like [0.00 - 2.50] text."
+        )
 
-    ref_path = _audio_path(reference_audio) if reference_audio else None
+    ref_path_raw = _audio_path(reference_audio) if reference_audio else None
+    needs_ref = tts_backend in ("XTTS v2", "Chatterbox", "F5-TTS", "Edge-TTS + OpenVoice")
+    use_openvoice = tts_backend == "Edge-TTS + OpenVoice"
 
-    # Backends that need a reference voice — auto-fallback to input audio
-    needs_ref = tts_backend in ("XTTS v2", "Chatterbox", "F5-TTS")
-    if needs_ref and (not ref_path or not Path(ref_path).exists()):
-        ref_path = input_audio_path if input_audio_path and Path(str(input_audio_path)).exists() else None
-        if not ref_path:
-            raise gr.Error(
-                f"{tts_backend} requires a reference voice audio. "
-                "Upload input audio in Step 1, or upload a separate Reference Voice Sample."
-            )
+    if needs_ref and (not ref_path_raw or not Path(ref_path_raw).exists()):
+        raise gr.Error(
+            f"„{tts_backend}” wymaga **osobnej** próbki głosu docelowego (Reference Voice Sample, 10–30 s). "
+            "To nie może być to samo audio co wejście z kroku 1 — tam jest stary głos / treść do przetłumaczenia. "
+            "Przygotuj plik w zakładce „Przygotuj referencję” i wgraj go tutaj."
+        )
+
+    ref_path = ref_path_raw
+    ref_status = ""
+    if ref_path and preprocess_reference:
+        ref_path, ref_status = _prepared_ref_path(ref_path_raw, preprocess=True, denoise=True)
 
     step_count = [0]
+    status_lines: list[str] = [f"**Wybrany silnik:** {tts_backend}"]
+    if ref_status:
+        status_lines.append(f"**Referencja:** {ref_status}")
 
     def log(msg: str):
         step_count[0] += 1
+        status_lines.append(msg)
         progress(min(0.1 + step_count[0] * 0.07, 0.92), desc=msg)
+
+    if use_openvoice:
+        status_lines.append(
+            "**Uwaga:** Edge-TTS + OpenVoice daje słabe podobieństwo do referencji "
+            "(najpierw głos Microsoftu, potem tylko kosmetyka barwy). "
+            "Dla prawdziwego klonu wybierz **Chatterbox**."
+        )
 
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
         out_path = tmp.name
 
-    if tts_backend == "XTTS v2":
-        progress(0.05, desc="Loading XTTS v2 model (first run: downloads ~1.8 GB)...")
-        tr.synthesize_from_edited(
-            edited_text=edited_text,
-            total_duration=float(total_duration),
-            target_language=target_language,
-            output_path=out_path,
-            sync=bool(sync),
-            tts_backend="xtts",
-            xtts_ref_path=ref_path,
-            xtts_speed=float(xtts_speed),
-            progress_cb=log,
-        )
-
-    elif tts_backend == "Chatterbox":
-        progress(0.05, desc="Loading Chatterbox model (first run: downloads ~1.5 GB)...")
-        tr.synthesize_from_edited(
-            edited_text=edited_text,
-            total_duration=float(total_duration),
-            target_language=target_language,
-            output_path=out_path,
-            sync=bool(sync),
-            tts_backend="chatterbox",
-            xtts_ref_path=ref_path,
-            chatterbox_exaggeration=float(chatterbox_exaggeration),
-            chatterbox_cfg_weight=float(chatterbox_cfg_weight),
-            progress_cb=log,
-        )
-
-    elif tts_backend == "F5-TTS":
-        model_path = f5tts_model_path.strip() if f5tts_model_path else None
-        if model_path == "":
-            model_path = None
-        progress(0.05, desc="Loading F5-TTS model...")
-        tr.synthesize_from_edited(
-            edited_text=edited_text,
-            total_duration=float(total_duration),
-            target_language=target_language,
-            output_path=out_path,
-            sync=bool(sync),
-            tts_backend="f5tts",
-            xtts_ref_path=ref_path,
-            f5tts_ref_text=f5tts_ref_text or "",
-            f5tts_model_path=model_path,
-            f5tts_speed=float(f5tts_speed),
-            progress_cb=log,
-        )
-
-    else:
-        # Edge-TTS (with optional OpenVoice)
-        rate_str = f"{int(tts_rate_pct):+d}%"
-        pitch_str = f"{int(tts_pitch_hz):+d}Hz"
-        use_openvoice = tts_backend == "Edge-TTS + OpenVoice" and ref_path and Path(ref_path).exists()
-
-        if use_openvoice:
-            import tempfile as _tf
-            with _tf.NamedTemporaryFile(suffix=".wav", delete=False) as _tmp:
-                tts_only_path = _tmp.name
+    try:
+        if tts_backend == "XTTS v2":
+            progress(0.05, desc="Loading XTTS v2 model (first run: downloads ~1.8 GB)...")
             tr.synthesize_from_edited(
                 edited_text=edited_text,
                 total_duration=float(total_duration),
                 target_language=target_language,
-                output_path=tts_only_path,
+                output_path=out_path,
                 sync=bool(sync),
-                tts_rate=rate_str,
-                tts_pitch=pitch_str,
-                tts_backend="edge",
+                tts_backend="xtts",
+                xtts_ref_path=ref_path,
+                xtts_speed=float(xtts_speed),
                 progress_cb=log,
             )
-            progress(0.85, desc="Applying OpenVoice tone-color transfer...")
-            openvoice_convert(
-                input_path=tts_only_path,
-                ref_path=ref_path,
+
+        elif tts_backend == "Chatterbox":
+            progress(0.05, desc="Loading Chatterbox Multilingual (wymaga referencji + VRAM)...")
+            tr.synthesize_from_edited(
+                edited_text=edited_text,
+                total_duration=float(total_duration),
+                target_language=target_language,
                 output_path=out_path,
-                chunk_duration_sec=_RUNTIME["openvoice_chunk_sec"],
-                progress_cb=lambda msg, _p=None: log(msg),
+                sync=bool(sync),
+                tts_backend="chatterbox",
+                xtts_ref_path=ref_path,
+                chatterbox_exaggeration=float(chatterbox_exaggeration),
+                chatterbox_cfg_weight=float(chatterbox_cfg_weight),
+                progress_cb=log,
             )
-            Path(tts_only_path).unlink(missing_ok=True)
+
+        elif tts_backend == "F5-TTS":
+            model_path = f5tts_model_path.strip() if f5tts_model_path else None
+            if model_path == "":
+                model_path = None
+            progress(0.05, desc="Loading F5-TTS model...")
+            tr.synthesize_from_edited(
+                edited_text=edited_text,
+                total_duration=float(total_duration),
+                target_language=target_language,
+                output_path=out_path,
+                sync=bool(sync),
+                tts_backend="f5tts",
+                xtts_ref_path=ref_path,
+                f5tts_ref_text=f5tts_ref_text or "",
+                f5tts_model_path=model_path,
+                f5tts_speed=float(f5tts_speed),
+                progress_cb=log,
+            )
+
         else:
-            tr.synthesize_from_edited(
-                edited_text=edited_text,
-                total_duration=float(total_duration),
-                target_language=target_language,
-                output_path=out_path,
-                sync=bool(sync),
-                tts_rate=rate_str,
-                tts_pitch=pitch_str,
-                tts_backend="edge",
-                progress_cb=log,
-            )
+            # Edge-TTS (with optional OpenVoice)
+            rate_str = f"{int(tts_rate_pct):+d}%"
+            pitch_str = f"{int(tts_pitch_hz):+d}Hz"
 
-    out_wav, _ = librosa.load(out_path, sr=SAMPLE_RATE, mono=True)
-    Path(out_path).unlink(missing_ok=True)
+            if use_openvoice and not openvoice_available():
+                raise gr.Error(
+                    "Wybrano „Edge-TTS + OpenVoice”, ale OpenVoice nie jest zainstalowany. "
+                    "W katalogu projektu uruchom: `.venv/bin/pip install openvoice-cli` "
+                    "i zrestartuj aplikację. Alternatywa: wybierz **Chatterbox**."
+                )
+
+            if use_openvoice:
+                import tempfile as _tf
+                with _tf.NamedTemporaryFile(suffix=".wav", delete=False) as _tmp:
+                    tts_only_path = _tmp.name
+                tr.synthesize_from_edited(
+                    edited_text=edited_text,
+                    total_duration=float(total_duration),
+                    target_language=target_language,
+                    output_path=tts_only_path,
+                    sync=bool(sync),
+                    tts_rate=rate_str,
+                    tts_pitch=pitch_str,
+                    tts_backend="edge",
+                    progress_cb=log,
+                )
+                progress(0.85, desc="Applying OpenVoice tone-color transfer...")
+                openvoice_convert(
+                    input_path=tts_only_path,
+                    ref_path=ref_path,
+                    output_path=out_path,
+                    chunk_duration_sec=_RUNTIME["openvoice_chunk_sec"],
+                    progress_cb=lambda msg, _p=None: log(msg),
+                )
+                Path(tts_only_path).unlink(missing_ok=True)
+            else:
+                tr.synthesize_from_edited(
+                    edited_text=edited_text,
+                    total_duration=float(total_duration),
+                    target_language=target_language,
+                    output_path=out_path,
+                    sync=bool(sync),
+                    tts_rate=rate_str,
+                    tts_pitch=pitch_str,
+                    tts_backend="edge",
+                    progress_cb=log,
+                )
+
+        out_wav, _ = librosa.load(out_path, sr=SAMPLE_RATE, mono=True)
+    except RuntimeError as e:
+        raise gr.Error(str(e)) from e
+    finally:
+        Path(out_path).unlink(missing_ok=True)
 
     progress(1.0, desc="Done.")
-    return (SAMPLE_RATE, out_wav)
+    status_lines.append(
+        "W logach terminala szukaj linii `Silnik: Chatterbox` lub `Chatterbox 1/N` — "
+        "jeśli widzisz `Edge-TTS`, klonowanie nie działało."
+    )
+    return (SAMPLE_RATE, out_wav), "\n\n".join(status_lines)
 
 
 def build_ui():
@@ -928,6 +1064,58 @@ def build_ui():
                     "Włącz „Apply OpenVoice post”, jeśli chcesz dodatkowo dociągnąć tembr."
                 )
 
+            # ── Tab: Prepare Reference ───────────────────────────────────────
+            with gr.Tab("Przygotuj referencję"):
+                gr.Markdown(
+                    "Wgraj **dowolnie długie** nagranie z głosem docelowym. "
+                    "Aplikacja wycina ciszę i fragmenty bez mowy (VAD), opcjonalnie redukuje szum, "
+                    "normalizuje głośność i wybiera **najczystsze okno** (~8–25 s) pod klonowanie głosu.\n\n"
+                    "Wynik zapisuje się obok pliku źródłowego jako `*.ref<hash>.wav` (24 kHz, mono) "
+                    "oraz można go pobrać poniżej."
+                )
+                with gr.Row():
+                    with gr.Column():
+                        refprep_input = gr.Audio(
+                            label="Nagranie źródłowe (dowolna długość)",
+                            type="filepath",
+                        )
+                        refprep_seconds = gr.Slider(
+                            minimum=8,
+                            maximum=25,
+                            value=20,
+                            step=1,
+                            label="Docelowa długość referencji (s)",
+                            info="Z najczystszego fragmentu wycina okno o tej długości.",
+                        )
+                        refprep_denoise = gr.Checkbox(
+                            value=True,
+                            label="Redukcja szumu (noisereduce)",
+                        )
+                        refprep_cache = gr.Checkbox(
+                            value=True,
+                            label="Użyj cache (szybsze ponowne przetwarzanie tego samego pliku)",
+                        )
+                        refprep_btn = gr.Button(
+                            "Przygotuj plik referencyjny",
+                            variant="primary",
+                        )
+                    with gr.Column():
+                        refprep_output = gr.Audio(
+                            label="Gotowa referencja (24 kHz)",
+                            type="filepath",
+                        )
+                        refprep_report = gr.Markdown(label="Raport")
+                refprep_btn.click(
+                    fn=run_prepare_reference,
+                    inputs=[refprep_input, refprep_seconds, refprep_denoise, refprep_cache],
+                    outputs=[refprep_output, refprep_report],
+                )
+                gr.Markdown(
+                    "**Wskazówki:** jeden mówca, bez muzyki w tle; im więcej czystej mowy w źródle, "
+                    "tym lepszy wybór okna. Do Chatterbox / Seed-VC wklej ten plik jako referencję "
+                    "(preprocessing w Voice Conversion możesz wtedy wyłączyć — plik jest już gotowy)."
+                )
+
             # ── Tab 2: Translate & Convert ───────────────────────────────────
             with gr.Tab("Translate & Convert"):
                 gr.Markdown(
@@ -1002,25 +1190,32 @@ def build_ui():
                             ),
                         )
                         tr_ref = gr.Audio(
-                            label="Reference Voice Sample — głos do sklonowania (10–30 s)",
+                            label="Reference Voice Sample — głos DOCELOWY (10–30 s, nie audio z kroku 1)",
                             type="filepath",
                         )
-                        tr_sync = gr.Checkbox(
+                        tr_ref_preprocess = gr.Checkbox(
                             value=True,
+                            label="Przygotuj referencję przed syntezą (VAD / denoise / najlepsze okno)",
+                        )
+                        tr_sync = gr.Checkbox(
+                            value=False,
                             label="Synchronize with source timing",
-                            info="Adjust silence gaps to match source segment duration (speech is never stretched)",
+                            info="Włącz tylko do dopasowania do wideo. Wyłączone = pełne słowa (wolniejsze/szybsze niż oryginał).",
                         )
                         with gr.Group(visible=True) as tr_group_chatterbox:
-                            gr.Markdown("**Chatterbox settings**")
+                            gr.Markdown(
+                                "**Chatterbox settings** — long text is auto-split into ~220 char chunks. "
+                                "Ucięte słowa? Wyłącz sync lub skróć tekst w segmencie."
+                            )
                             tr_cb_exaggeration = gr.Slider(
                                 minimum=0.0, maximum=1.0, value=0.5, step=0.05,
                                 label="Emotion exaggeration",
                                 info="Higher = more expressive/dramatic speech.",
                             )
                             tr_cb_cfg = gr.Slider(
-                                minimum=0.0, maximum=1.0, value=0.5, step=0.05,
+                                minimum=0.0, maximum=1.0, value=0.7, step=0.05,
                                 label="CFG weight (guidance)",
-                                info="Higher = more faithful to reference voice.",
+                                info="Wyżej = bliżej referencji (0.7–0.85). Za nisko brzmi jak głos bazowy.",
                             )
                         with gr.Group(visible=False) as tr_group_f5tts:
                             gr.Markdown("**F5-TTS settings**")
@@ -1067,6 +1262,10 @@ def build_ui():
                     with gr.Column():
                         gr.Markdown("### Output")
                         tr_output = gr.Audio(label="Output Audio", type="numpy")
+                        tr_step2_status = gr.Markdown(
+                            label="Status syntezy",
+                            value="Po syntezie tutaj pojawi się użyty silnik i podpowiedzi.",
+                        )
 
                 tr_step1_btn.click(
                     fn=run_step1_transcribe,
@@ -1106,14 +1305,15 @@ def build_ui():
                         tr_cb_exaggeration, tr_cb_cfg,
                         tr_f5_ref_text, tr_f5_model_path, tr_f5_speed,
                         tr_input_state,
+                        tr_ref_preprocess,
                     ],
-                    outputs=[tr_output],
+                    outputs=[tr_output, tr_step2_status],
                 )
                 gr.Markdown(
-                    "**Tips:** "
-                    "**Chatterbox** needs 10–30 s of reference audio, downloads ~1.5 GB on first use. "
-                    "**F5-TTS** needs 5–15 s reference + optional transcript; use `polish` model path for Polish. "
-                    "**Fine-tuning F5-TTS:** `python finetune_f5tts.py --data_dir ./voice_data --base polish`"
+                    "**Klonowanie:** wybierz **Chatterbox** i wgraj osobną referencję. "
+                    "W terminalu muszą być linie `Chatterbox 1/N`, nie `Edge-TTS`. "
+                    "**Edge-TTS + OpenVoice** nie daje pełnego klonu. "
+                    "**F5-TTS:** 5–15 s referencji + opcjonalnie transkrypt; ścieżka `polish` dla PL."
                 )
 
 

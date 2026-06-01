@@ -139,6 +139,25 @@ def synth_speech_chunk(
                 raise RuntimeError("Chatterbox requires a reference voice sample.")
             if not chatterbox_engine.is_available():
                 raise RuntimeError("Chatterbox TTS not available (chatterbox-tts missing).")
+            m = chatterbox_engine.get_model()
+            if not getattr(m, "_is_multilingual", False) and (language or "en").strip().lower() != "en":
+                from translate import edge_voice_for_lang_code
+
+                return synth_speech_chunk(
+                    txt,
+                    engine="edge",
+                    language=language,
+                    ref_audio_path=ref_audio_path,
+                    edge_voice=edge_voice_for_lang_code(language),
+                    edge_rate=edge_rate,
+                    edge_pitch=edge_pitch,
+                    xtts_speed=xtts_speed,
+                    chatterbox_exaggeration=chatterbox_exaggeration,
+                    chatterbox_cfg_weight=chatterbox_cfg_weight,
+                    f5tts_ref_text=f5tts_ref_text,
+                    f5tts_model_path=f5tts_model_path,
+                    f5tts_speed=f5tts_speed,
+                )
             chatterbox_engine.synthesize(
                 text=txt,
                 language=language,

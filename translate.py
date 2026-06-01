@@ -32,6 +32,8 @@ import argostranslate.translate
 
 SAMPLE_RATE = 16000
 VAD_TOP_DB = 30  # silence threshold (dB below peak) for speech/silence split
+# Max time-compression when TTS is longer than the Whisper segment (higher = fewer hard cuts)
+MAX_SYNC_SPEEDUP = 2.0
 
 # Target languages: ISO 639-1 code + edge-tts neural voice
 LANGUAGES: dict[str, dict] = {
@@ -46,6 +48,16 @@ LANGUAGES: dict[str, dict] = {
     "Dutch":      {"lang_code": "nl", "tts_voice": "nl-NL-ColetteNeural"},
     "Portuguese": {"lang_code": "pt", "tts_voice": "pt-PT-RaquelNeural"},
 }
+
+
+def edge_voice_for_lang_code(lang_code: str) -> str:
+    """Microsoft Edge neural voice id for ISO 639-1 code (see LANGUAGES). Unknown → US English."""
+    lc = (lang_code or "en").strip().lower()
+    for meta in LANGUAGES.values():
+        if meta["lang_code"] == lc:
+            return meta["tts_voice"]
+    return LANGUAGES["English"]["tts_voice"]
+
 
 _whisper_model: WhisperModel | None = None
 _whisper_cfg: tuple[str, str, str] | None = None  # (size, device, compute_type)
@@ -101,6 +113,27 @@ def get_whisper(
         _whisper_cfg = target
         print("Whisper loaded.")
     return _whisper_model
+
+
+def unload_whisper() -> None:
+    """Free VRAM held by the cached faster-whisper model (best-effort)."""
+    global _whisper_model, _whisper_cfg
+    if _whisper_model is None:
+        return
+    try:
+        del _whisper_model
+    except Exception:
+        pass
+    _whisper_model = None
+    _whisper_cfg = None
+    try:
+        import gc
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+    print("Whisper unloaded.")
 
 
 def ensure_translation_package(from_code: str, to_code: str) -> None:
@@ -223,6 +256,53 @@ def tts_to_file(text: str, target_language: str, output_path: str,
 
 # ── Silence-aware fitting ─────────────────────────────────────────────────────
 
+def _speech_intervals(wav: np.ndarray) -> list[tuple[int, int]]:
+    if len(wav) == 0:
+        return []
+    return [(int(s), int(e)) for s, e in librosa.effects.split(wav, top_db=VAD_TOP_DB)]
+
+
+def _concat_speech(wav: np.ndarray, intervals: list[tuple[int, int]]) -> np.ndarray:
+    if not intervals:
+        return wav.astype(np.float32)
+    return np.concatenate([wav[s:e].astype(np.float32) for s, e in intervals])
+
+
+def _truncate_at_speech_boundary(wav: np.ndarray, target_samples: int) -> np.ndarray:
+    """
+    Fit into ``target_samples`` using only *whole* VAD speech regions.
+    Never slices inside a region (avoids cutting a word in half).
+    """
+    if target_samples <= 0:
+        return np.zeros(0, dtype=np.float32)
+    wav = wav.astype(np.float32)
+    if len(wav) <= target_samples:
+        return np.pad(wav, (0, target_samples - len(wav)))
+
+    intervals = _speech_intervals(wav)
+    if not intervals:
+        return wav[:target_samples]
+
+    parts: list[np.ndarray] = []
+    used = 0
+    for s, e in intervals:
+        chunk = wav[s:e]
+        if used + len(chunk) > target_samples:
+            break
+        parts.append(chunk)
+        used += len(chunk)
+
+    if not parts:
+        ratio = len(wav) / max(1, target_samples)
+        stretched = librosa.effects.time_stretch(wav, rate=float(min(ratio, MAX_SYNC_SPEEDUP + 0.5)))
+        return stretched[:target_samples]
+
+    result = np.concatenate(parts)
+    if len(result) < target_samples:
+        result = np.pad(result, (0, target_samples - len(result)))
+    return result.astype(np.float32)
+
+
 def _fit_by_silence(tts_wav: np.ndarray, target_samples: int) -> np.ndarray:
     """
     Fit TTS audio to target_samples by scaling ONLY the silence regions.
@@ -251,10 +331,25 @@ def _fit_by_silence(tts_wav: np.ndarray, target_samples: int) -> np.ndarray:
 
     speech_total = sum(int(e - s) for s, e in intervals)
 
-    # If speech alone is already longer than target, concatenate speech and trim
+    # Speech longer than the segment slot: time-stretch, then trim only on speech boundaries.
     if speech_total >= target_samples:
-        parts = [tts_wav[s:e] for s, e in intervals]
-        return np.concatenate(parts).astype(np.float32)[:target_samples]
+        speech_only = _concat_speech(tts_wav, intervals)
+        ratio = speech_total / max(1, target_samples)
+        if ratio <= MAX_SYNC_SPEEDUP:
+            stretched = librosa.effects.time_stretch(speech_only, rate=float(ratio))
+            stretched = stretched.astype(np.float32)
+            if len(stretched) <= target_samples:
+                return np.pad(stretched, (0, target_samples - len(stretched)))
+            return _truncate_at_speech_boundary(stretched, target_samples)
+        print(
+            f"[sync] TTS is {ratio:.2f}x longer than segment — compressing to {MAX_SYNC_SPEEDUP}x "
+            f"then dropping tail *words* (not mid-word). Shorten translation or disable sync.",
+            flush=True,
+        )
+        stretched = librosa.effects.time_stretch(
+            speech_only, rate=float(MAX_SYNC_SPEEDUP),
+        ).astype(np.float32)
+        return _truncate_at_speech_boundary(stretched, target_samples)
 
     silence_budget = target_samples - speech_total
     orig_silence_total = sum(silence_orig)
@@ -344,11 +439,10 @@ def _build_synced_audio(
 
         tts_warped = _fit_by_silence(tts_wav, target_samples)
 
-        # Place in output buffer
-        end_s = seg_start_s + len(tts_warped)
-        if end_s > len(out):
-            out = np.pad(out, (0, end_s - len(out)))
-        out[seg_start_s:end_s] += tts_warped
+        slot_end = seg_start_s + target_samples
+        if slot_end > len(out):
+            out = np.pad(out, (0, slot_end - len(out)))
+        out[seg_start_s:slot_end] = tts_warped
 
     return out, " ".join(all_english), " ".join(all_translated)
 
@@ -426,6 +520,14 @@ def run_pipeline(
 # ── Two-step pipeline (for interactive text editing) ─────────────────────────
 
 _SEGMENT_RE = re.compile(r"^\[\s*(\d+(?:\.\d+)?)\s*-\s*(\d+(?:\.\d+)?)\s*\]\s*(.*)", re.MULTILINE)
+
+
+def infer_duration_from_segments(segments_text: str) -> float:
+    """Last segment end time from [start - end] lines (fallback when Step 1 state is missing)."""
+    parsed = _SEGMENT_RE.findall(segments_text)
+    if not parsed:
+        return 0.0
+    return max(float(end_s) for _start_s, end_s, _text in parsed)
 
 
 def transcribe_and_translate(
@@ -680,48 +782,75 @@ def synthesize_from_edited(
         raise ValueError("No segments found in edited text. Expected format: [start - end] Text...")
 
     lang_code = LANGUAGES[target_language]["lang_code"]
+    voice = LANGUAGES[target_language]["tts_voice"]
 
-    # Resolve which backend to use, with graceful fallback
-    backend = tts_backend.lower()
+    backend = (tts_backend or "edge").lower().strip()
     ref_path = xtts_ref_path  # shared reference audio for all cloning backends
 
+    # Cloning backends must not silently fall back to Edge-TTS (preset Microsoft voice).
     if backend == "xtts":
         try:
             import xtts_engine
-            if not xtts_engine.is_available() or not ref_path or not Path(ref_path).exists():
-                step("XTTS unavailable/no ref — falling back to edge-tts")
-                backend = "edge"
-        except ImportError:
-            step("XTTS not installed — falling back to edge-tts")
-            backend = "edge"
+        except ImportError as e:
+            raise RuntimeError(
+                "XTTS v2 nie jest zainstalowany. Uruchom: pip install coqui-tts"
+            ) from e
+        if not xtts_engine.is_available():
+            raise RuntimeError("XTTS v2 jest zainstalowany, ale nie udało się go załadować.")
+        if not ref_path or not Path(ref_path).exists():
+            raise RuntimeError(
+                "XTTS wymaga pliku referencyjnego (10–30 s czystej mowy docelowego mówcy)."
+            )
+        step(f"Silnik: XTTS v2 | referencja: {Path(ref_path).name}")
 
     elif backend == "chatterbox":
         try:
             import chatterbox_engine
-            if not chatterbox_engine.is_available():
-                step("Chatterbox not installed — falling back to edge-tts")
-                backend = "edge"
-            elif not ref_path or not Path(ref_path).exists():
-                step("Chatterbox requires a reference audio — falling back to edge-tts")
-                backend = "edge"
-        except ImportError:
-            step("Chatterbox not installed — falling back to edge-tts")
-            backend = "edge"
+        except ImportError as e:
+            raise RuntimeError(
+                "Chatterbox nie jest zainstalowany. Uruchom: pip install chatterbox-tts"
+            ) from e
+        if not chatterbox_engine.is_available():
+            raise RuntimeError("Chatterbox jest niedostępny w tym środowisku.")
+        if not ref_path or not Path(ref_path).exists():
+            raise RuntimeError(
+                "Chatterbox wymaga pliku referencyjnego (10–30 s). "
+                "Wgraj „Reference Voice Sample” lub użyj zakładki „Przygotuj referencję”."
+            )
+        m = chatterbox_engine.get_model()
+        if not getattr(m, "_is_multilingual", False) and lang_code != "en":
+            raise RuntimeError(
+                "Załadowano tylko angielski Chatterbox (Multilingual nie wszedł — zwykle brak VRAM). "
+                "Zwolnij GPU (nvidia-smi), zamknij inne modele i spróbuj ponownie, "
+                "albo wybierz XTTS / F5-TTS. Nie używamy Edge-TTS zamiast klonowania."
+            )
+        step(
+            f"Silnik: Chatterbox Multilingual | referencja: {Path(ref_path).name} | język: {lang_code}"
+        )
 
     elif backend == "f5tts":
         try:
             import f5tts_engine
-            if not f5tts_engine.is_available():
-                step("F5-TTS not installed — falling back to edge-tts")
-                backend = "edge"
-            elif not ref_path or not Path(ref_path).exists():
-                step("F5-TTS requires a reference audio — falling back to edge-tts")
-                backend = "edge"
-        except ImportError:
-            step("F5-TTS not installed — falling back to edge-tts")
-            backend = "edge"
+        except ImportError as e:
+            raise RuntimeError(
+                "F5-TTS nie jest zainstalowany. Uruchom: pip install f5-tts"
+            ) from e
+        if not f5tts_engine.is_available():
+            raise RuntimeError("F5-TTS jest niedostępny w tym środowisku.")
+        if not ref_path or not Path(ref_path).exists():
+            raise RuntimeError(
+                "F5-TTS wymaga pliku referencyjnego (5–15 s) + opcjonalnie transkrypt."
+            )
+        step(f"Silnik: F5-TTS | referencja: {Path(ref_path).name}")
 
-    voice = LANGUAGES[target_language]["tts_voice"]
+    elif backend != "edge":
+        raise RuntimeError(f"Nieznany silnik TTS: {tts_backend!r}")
+    else:
+        step(
+            f"Silnik: Edge-TTS ({voice}) — to głos Microsoftu, NIE klon z referencji. "
+            "Dla klonowania wybierz Chatterbox / XTTS / F5-TTS."
+        )
+
     total_samples = int(total_duration * SAMPLE_RATE)
     out = np.zeros(total_samples, dtype=np.float32)
 
@@ -772,7 +901,7 @@ def synthesize_from_edited(
             )
 
         else:  # edge-tts
-            step(f"TTS {i+1}/{n}: {text[:70]}")
+            step(f"Edge-TTS {i+1}/{n}: {text[:70]}")
             Path(tts_path).unlink(missing_ok=True)
             with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
                 tts_path = f.name
@@ -788,12 +917,17 @@ def synthesize_from_edited(
         seg_end = min(int(end_f * SAMPLE_RATE), total_samples)
         target_samples = seg_end - seg_start
 
-        tts_warped = _fit_by_silence(tts_wav, target_samples) if sync else tts_wav
-
-        end_idx = seg_start + len(tts_warped)
-        if end_idx > len(out):
-            out = np.pad(out, (0, end_idx - len(out)))
-        out[seg_start:end_idx] += tts_warped
+        if sync:
+            tts_warped = _fit_by_silence(tts_wav, target_samples)
+            slot_end = seg_start + target_samples
+            if slot_end > len(out):
+                out = np.pad(out, (0, slot_end - len(out)))
+            out[seg_start:slot_end] = tts_warped
+        else:
+            place_end = min(seg_start + len(tts_wav), total_samples)
+            if place_end > len(out):
+                out = np.pad(out, (0, place_end - len(out)))
+            out[seg_start:place_end] = tts_wav[: place_end - seg_start]
 
     # Voice conversion — only for edge-tts backend (others have built-in voice cloning)
     if backend == "edge" and knn_vc is not None and matching_set is not None:
