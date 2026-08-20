@@ -184,8 +184,6 @@ def synth_speech_chunk(
                 if not f5tts_engine.is_available():
                     raise RuntimeError("F5-TTS not installed (f5-tts missing).")
                 model_path = f5tts_model_path
-                if not model_path and (language or "").strip().lower() == "pl":
-                    model_path = "polish"
                 f5tts_engine.synthesize(
                     text=sub,
                     ref_audio_path=ref_audio_path,
@@ -193,6 +191,7 @@ def synth_speech_chunk(
                     ref_text=f5tts_ref_text or "",
                     model_path=model_path,
                     speed=float(f5tts_speed),
+                    language=language,
                 )
 
             else:
@@ -268,7 +267,7 @@ def render_tagged_script(
 
     engine = (speech_engine or "edge").lower().strip()
     if not f5tts_model_path and (language or "").strip().lower() == "pl" and engine == "f5tts":
-        f5tts_model_path = "polish"
+        f5tts_model_path = None
 
     sr = _target_sr_for_engine(engine)
     out_parts: list[np.ndarray] = []

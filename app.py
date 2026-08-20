@@ -55,10 +55,10 @@ _RUNTIME = {"openvoice_chunk_sec": float(_OV_DEFAULT_CHUNK_SEC)}
 
 
 def _default_tts_backend(has_f5: bool, has_cb: bool) -> str:
-    if has_f5:
-        return "F5-TTS"
     if has_cb:
         return "Chatterbox"
+    if has_f5:
+        return "F5-TTS"
     return "Edge-TTS + OpenVoice"
 
 
@@ -738,9 +738,7 @@ def run_step2_synthesize(
             if model_path == "":
                 model_path = None
             if model_path is None:
-                lang_meta = tr.LANGUAGES.get(target_language, {})
-                if lang_meta.get("lang_code") == "pl":
-                    model_path = "polish"
+                model_path = None  # base F5 zero-shot; do not use broken Gregniuki 'polish' vocab
             progress(0.05, desc="Loading F5-TTS model...")
             output_sr = tr.synthesize_from_edited(
                 output_path=out_path,
@@ -853,8 +851,8 @@ def build_ui():
                         )
                         with gr.Row():
                             speech_engine = gr.Dropdown(
-                                choices=["F5-TTS", "Chatterbox", "XTTS v2", "Edge-TTS"],
-                                value=("F5-TTS" if has_f5 else ("Chatterbox" if has_cb_tts else "Edge-TTS")),
+                                choices=["Chatterbox", "F5-TTS", "XTTS v2", "Edge-TTS"],
+                                value=("Chatterbox" if has_cb_tts else ("F5-TTS" if has_f5 else "Edge-TTS")),
                                 label="Speech engine",
                             )
                             use_bark_tags = gr.Checkbox(
@@ -911,7 +909,7 @@ def build_ui():
                             ref_audio_path=ref_path,
                             use_bark_for_tags=bool(bark_on),
                             bark_preset=bark_hp or "v2/pl_speaker_0",
-                            f5tts_model_path="polish" if speech == "f5tts" else None,
+                            f5tts_model_path=None,
                         )
                     except RuntimeError as e:
                         raise gr.Error(str(e)) from e
@@ -1219,8 +1217,8 @@ def build_ui():
                             value=_default_tts_backend(has_f5, has_cb_tts),
                             label="TTS Engine",
                             info=(
-                                "F5-TTS: najlepsza naturalność PL (checkpoint polish). "
-                                "Chatterbox: zero-shot, natywny polski. "
+                                "Chatterbox: najlepszy wybór dla polskiego (natywny PL). "
+                                "F5-TTS: zero-shot EN-bias, wymaga transkryptu referencji. "
                                 "XTTS v2: zero-shot klonowanie głosu. "
                                 "Edge-TTS + OpenVoice: lekka opcja online."
                             ),
@@ -1255,8 +1253,8 @@ def build_ui():
                         )
                         with gr.Group(visible=True) as tr_group_chatterbox:
                             gr.Markdown(
-                                "**Chatterbox settings** — long text is auto-split into ~220 char chunks. "
-                                "Ucięte słowa? Wyłącz sync lub skróć tekst w segmencie."
+                                "**Chatterbox settings** — long text is auto-split into ~280 char chunks with crossfade. "
+                                "Ucięte słowa? Użyj sync=gentle/off lub skróć tekst w segmencie."
                             )
                             tr_cb_exaggeration = gr.Slider(
                                 minimum=0.0, maximum=1.0, value=0.35, step=0.05,
@@ -1271,16 +1269,16 @@ def build_ui():
                         with gr.Group(visible=False) as tr_group_f5tts:
                             gr.Markdown("**F5-TTS settings**")
                             tr_f5_ref_text = gr.Textbox(
-                                label="Reference audio transcript (F5-TTS)",
-                                placeholder="Wpisz transkrypt nagrania referencyjnego dla lepszej jakości...",
+                                label="Reference audio transcript (F5-TTS) — wymagane dla jakości",
+                                placeholder="Wpisz dokładny transkrypt nagrania referencyjnego po polsku...",
                                 lines=2,
-                                info="Transcript of the reference voice audio. Leave empty to auto-detect.",
+                                info="F5-TTS wymaga poprawnego transkryptu referencji. Bez tego brzmi jak szum.",
                             )
                             tr_f5_model_path = gr.Textbox(
                                 label="F5-TTS model path (optional)",
-                                value="polish",
-                                placeholder='Puste = model bazowy. Wpisz "polish" dla modelu PL lub ścieżkę do .pt',
-                                info='Domyślnie "polish" — community checkpoint PL (~3 GB).',
+                                value="",
+                                placeholder='Puste = model bazowy (zero-shot). NIE używaj "polish" — ma zły vocab.',
+                                info="Checkpoint Gregniuki 'polish' jest uszkodzony dla PL. Zostaw puste lub podaj własny .pt.",
                             )
                             tr_f5_speed = gr.Slider(
                                 minimum=0.5, maximum=2.0, value=1.0, step=0.05,
@@ -1364,10 +1362,8 @@ def build_ui():
                     outputs=[tr_output, tr_step2_status],
                 )
                 gr.Markdown(
-                    "**Klonowanie:** wybierz **Chatterbox** i wgraj osobną referencję. "
-                    "W terminalu muszą być linie `Chatterbox 1/N`, nie `Edge-TTS`. "
-                    "**Edge-TTS + OpenVoice** nie daje pełnego klonu. "
-                    "**F5-TTS:** 5–15 s referencji + opcjonalnie transkrypt; ścieżka `polish` dla PL."
+                    "**Chatterbox** (zalecany PL): wgraj referencję 10–30 s. "
+                    "**F5-TTS:** wymaga transkryptu referencji; checkpoint 'polish' nie działa dla PL."
                 )
 
 

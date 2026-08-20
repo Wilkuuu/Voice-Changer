@@ -501,8 +501,6 @@ def _synthesize_tts_file(
     elif backend == "f5tts":
         import f5tts_engine
         model_path = f5tts_model_path
-        if model_path is None and lang_code == "pl":
-            model_path = "polish"
         f5tts_engine.synthesize(
             text=text,
             ref_audio_path=ref_path,
@@ -511,6 +509,7 @@ def _synthesize_tts_file(
             model_path=model_path,
             speed=f5tts_speed,
             seed=seed,
+            language=lang_code,
         )
     else:
         Path(tts_path).unlink(missing_ok=True)
@@ -1069,11 +1068,9 @@ def synthesize_from_edited(
             raise RuntimeError("F5-TTS jest niedostępny w tym środowisku.")
         if not ref_path or not Path(ref_path).exists():
             raise RuntimeError(
-                "F5-TTS wymaga pliku referencyjnego (5–15 s) + opcjonalnie transkrypt."
+                "F5-TTS wymaga pliku referencyjnego (5–15 s) + transkrypt referencji."
             )
-        if not f5tts_model_path and lang_code == "pl":
-            f5tts_model_path = "polish"
-        step(f"Silnik: F5-TTS | referencja: {Path(ref_path).name} | sync={sync_mode}")
+        step(f"Silnik: F5-TTS (zero-shot) | referencja: {Path(ref_path).name} | sync={sync_mode}")
 
     elif backend != "edge":
         raise RuntimeError(f"Nieznany silnik TTS: {tts_backend!r}")

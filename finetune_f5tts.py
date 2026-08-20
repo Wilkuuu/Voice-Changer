@@ -112,7 +112,7 @@ def download_base_checkpoint(base: str) -> str:
         from huggingface_hub import hf_hub_download
         path = hf_hub_download(
             repo_id="Gregniuki/F5-tts_English_German_Polish",
-            filename="model_1096000.pt",
+            filename="Polish/model_500000.pt",
         )
         print(f"Polish community checkpoint: {path}")
         return path

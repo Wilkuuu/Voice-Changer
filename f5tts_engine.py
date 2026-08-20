@@ -26,6 +26,12 @@ from pathlib import Path
 
 _tts = None
 _loaded_model_path: str | None = None
+
+# Gregniuki repo — NOTE: Polish/*.pt checkpoints ship with a pinyin vocab (not Polish).
+# Do NOT use for Polish TTS; kept only for manual/experimental overrides.
+_POLISH_REPO = "Gregniuki/F5-tts_English_German_Polish"
+_POLISH_CKPT = "Polish/model_500000.pt"
+_POLISH_VOCAB = "Polish/vocab.txt"
 _ref_text_cache: dict[str, str] = {}
 
 
@@ -47,24 +53,40 @@ def get_tts(model_path: str | None = None):
     """
     global _tts, _loaded_model_path
 
-    # Resolve "polish" shorthand to community checkpoint
-    if model_path == "polish":
-        from huggingface_hub import hf_hub_download
-        model_path = hf_hub_download(
-            repo_id="Gregniuki/F5-tts_English_German_Polish",
-            filename="model_1096000.pt",
-        )
-        print(f"[F5-TTS] Polish community checkpoint: {model_path}")
+    vocab_file = ""
+    cache_key = model_path
 
-    if _tts is None or model_path != _loaded_model_path:
+    # Resolve "polish" shorthand — community checkpoint uses pinyin vocab (broken for PL).
+    if model_path == "polish":
+        print(
+            "[F5-TTS] WARNING: Gregniuki 'polish' checkpoint uses a pinyin vocab and produces "
+            "garbled output for Polish text. Falling back to F5TTS_v1_Base (zero-shot). "
+            "For Polish, use Chatterbox Multilingual instead.",
+            flush=True,
+        )
+        model_path = None
+        cache_key = "base"
+
+    if model_path == "polish_legacy":
+        from huggingface_hub import hf_hub_download
+        ckpt = hf_hub_download(repo_id=_POLISH_REPO, filename=_POLISH_CKPT)
+        vocab_file = hf_hub_download(repo_id=_POLISH_REPO, filename=_POLISH_VOCAB)
+        model_path = ckpt
+        cache_key = "polish_legacy"
+        print(f"[F5-TTS] Legacy Polish checkpoint (experimental): {ckpt}", flush=True)
+
+    if _tts is None or cache_key != _loaded_model_path:
         from f5_tts.api import F5TTS
         if model_path:
             print(f"[F5-TTS] Loading custom model: {model_path}")
-            _tts = F5TTS(ckpt_file=model_path)
+            kwargs = {"ckpt_file": model_path}
+            if vocab_file:
+                kwargs["vocab_file"] = vocab_file
+            _tts = F5TTS(**kwargs)
         else:
             print("[F5-TTS] Loading base F5TTS_v1_Base model...")
             _tts = F5TTS(model_type="F5TTS_v1_Base")
-        _loaded_model_path = model_path
+        _loaded_model_path = cache_key
         print("[F5-TTS] Model loaded.")
     return _tts
 
@@ -76,7 +98,11 @@ def _ref_text_cache_path(ref_audio_path: str) -> Path:
     return p.with_suffix(f".reftext{key}.txt")
 
 
-def get_or_transcribe_ref_text(ref_audio_path: str, ref_text: str = "") -> str:
+def get_or_transcribe_ref_text(
+    ref_audio_path: str,
+    ref_text: str = "",
+    language: str = "pl",
+) -> str:
     """
     Return reference transcript for F5-TTS. Uses explicit ``ref_text``, disk cache,
     or Whisper auto-transcription on the reference file.
@@ -85,13 +111,16 @@ def get_or_transcribe_ref_text(ref_audio_path: str, ref_text: str = "") -> str:
     if explicit:
         return explicit
 
-    cache_key = str(Path(ref_audio_path).resolve())
+    lang = (language or "pl").strip().lower()
+    cache_key = f"{Path(ref_audio_path).resolve()}:{lang}"
     if cache_key in _ref_text_cache:
         return _ref_text_cache[cache_key]
 
     cache_path = _ref_text_cache_path(ref_audio_path)
-    if cache_path.exists():
-        text = cache_path.read_text(encoding="utf-8").strip()
+    # Include language in sidecar to avoid reusing wrong-language transcripts.
+    lang_cache = cache_path.with_name(cache_path.stem + f".{lang}.txt")
+    if lang_cache.exists():
+        text = lang_cache.read_text(encoding="utf-8").strip()
         if text:
             _ref_text_cache[cache_key] = text
             return text
@@ -99,19 +128,26 @@ def get_or_transcribe_ref_text(ref_audio_path: str, ref_text: str = "") -> str:
     try:
         from translate import get_whisper
         model = get_whisper(model_size="base")
-        segments, _info = model.transcribe(ref_audio_path, beam_size=3, vad_filter=True)
+        segments, info = model.transcribe(
+            ref_audio_path,
+            beam_size=5,
+            vad_filter=True,
+            language=lang if lang != "auto" else None,
+            task="transcribe",
+        )
         text = " ".join(seg.text.strip() for seg in segments if seg.text.strip())
+        detected = getattr(info, "language", lang)
+        print(f"[F5-TTS] Auto ref_text (lang={detected}, {len(text)} chars): {text[:80]}...", flush=True)
     except Exception as e:
         print(f"[F5-TTS] Auto ref_text transcription failed ({e}); using empty ref_text.", flush=True)
         text = ""
 
     if text:
         try:
-            cache_path.write_text(text, encoding="utf-8")
+            lang_cache.write_text(text, encoding="utf-8")
         except Exception:
             pass
         _ref_text_cache[cache_key] = text
-        print(f"[F5-TTS] Auto ref_text ({len(text)} chars): {text[:80]}...", flush=True)
     return text
 
 
@@ -123,6 +159,7 @@ def synthesize(
     model_path: str | None = None,
     speed: float = 1.0,
     seed: int = -1,
+    language: str = "pl",
 ) -> None:
     """
     Synthesize text with zero-shot voice cloning via flow matching.
@@ -140,7 +177,7 @@ def synthesize(
     """
     import soundfile as sf
 
-    resolved_ref_text = get_or_transcribe_ref_text(ref_audio_path, ref_text)
+    resolved_ref_text = get_or_transcribe_ref_text(ref_audio_path, ref_text, language=language)
     tts = get_tts(model_path)
     wav, sr, _ = tts.infer(
         ref_file=ref_audio_path,
