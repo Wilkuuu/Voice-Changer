@@ -1,147 +1,87 @@
-# Voice Changer — Zero-Shot Voice Conversion
+# Voice Changer — Zero-Shot Voice Conversion & TTS
 
-Speech-to-speech voice conversion without training.
+Speech-to-speech voice conversion and voice-cloned TTS without per-speaker training.
 
-- **Branch `natural-clone`:** **OpenVoice** tone-color transfer (more natural cloning, GPU).
-- **Branch `gpu` / `main`:** **kNN-VC** (HuBERT/WavLM + k-NN + HiFiGAN).
+## Features
 
-## Branch: natural-clone (OpenVoice)
-
-The **Voice Conversion** tab uses [OpenVoice](https://github.com/myshell-ai/OpenVoice) (via `openvoice-cli`) for natural voice cloning from a single reference sample.
-
-### Installation (natural-clone)
-
-```bash
-git checkout natural-clone
-pip install -r requirements.txt
-```
-
-For GPU (recommended):
-
-```bash
-pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu118
-```
-
-If dependency conflicts appear (e.g. `librosa`), use a dedicated venv:
-
-```bash
-python -m venv .venv-openvoice
-source .venv-openvoice/bin/activate  # or .venv-openvoice\Scripts\activate on Windows
-pip install -r requirements.txt
-pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu118
-```
-
-### Usage (natural-clone)
-
-- **Voice Conversion:** Upload input audio + reference voice → Convert. No Top-K or extra options; OpenVoice handles tone transfer.
-- **Translate & Convert:** Unchanged (Whisper + TTS + optional kNN-VC).
-
----
-
-## Branch: gpu / main (kNN-VC)
-
-Based on [bshall/knn-vc](https://github.com/bshall/knn-vc) — HuBERT/WavLM features and k-NN matching.
+- **Voice Conversion** — Chatterbox VC, Seed-VC, OpenVoice, Chatterbox TTS (ASR → resynthesis)
+- **Translate & Convert** — Whisper/Argos translation or SRT import → cloned TTS (F5-TTS, Chatterbox, XTTS v2, Edge-TTS)
+- **Tagged TTS** — plain-text scripts with optional Bark tags (`[śmiech]`, `[pauza]`, …)
+- **Prepare Reference** — VAD, denoise, LUFS normalization, best-window selection
 
 ## Requirements
 
-- Python 3.9+
+- Python 3.9+ (3.12 supported with `coqui-tts` fork)
 - PyTorch (CPU or CUDA)
-- ~1.5 GB disk space for kNN-VC weights (downloaded automatically on first run)
-- For natural-clone: `openvoice-cli` (see above)
+- GPU recommended for Chatterbox / F5-TTS / Seed-VC (~6–8 GB VRAM)
 
-## Installation (default)
+## Installation
 
 ```bash
 pip install -r requirements.txt
 ```
 
-For GPU support, install PyTorch with CUDA:
+For GPU support:
+
 ```bash
 pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu121
 ```
 
-## Usage
-
-### CLI
+Optional engines (install as needed):
 
 ```bash
-python convert.py --input input.wav --reference reference.wav --output output.wav
+pip install chatterbox-tts    # Chatterbox TTS + VC
+pip install f5-tts            # F5-TTS (recommended for Polish)
+pip install coqui-tts         # XTTS v2
+pip install openvoice-cli     # OpenVoice tone transfer
+pip install seed-vc           # Seed-VC
 ```
 
-Options:
-- `--input / -i`     — source audio (voice to convert)
-- `--reference / -r` — target voice sample (5-30s recommended)
-- `--output / -o`    — output file path
-- `--topk`           — number of nearest neighbors (default: 4, higher = smoother)
-- `--device`         — `auto` | `cuda` | `cpu`
+## Usage
 
-### Web UI
+### Web UI (full app)
 
 ```bash
 python app.py
-# then open http://localhost:7860
+# open http://localhost:7862
 ```
 
-Options:
-- `--port 7861`  — custom port
-- `--share`      — create public Gradio tunnel URL
-- `--host 0.0.0.0` — listen on all interfaces
+Options: `--port`, `--share`, `--host 0.0.0.0`, `--low-vram`, `--cpu`
+
+### Simple VC UI
+
+```bash
+python simple_vc.py --port 7870
+```
+
+### CLI (kNN-VC)
+
+```bash
+python convert.py -i input.wav -r reference.wav -o output.wav --topk 4
+```
 
 ## Docker
 
-Pre-built `Dockerfile` + `docker-compose.yml` are included.
-
-Requirements on the host:
-
-- Docker Engine 25+ with Compose v2 (`docker compose version`)
-- For GPU: the NVIDIA driver **and** the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html) (`nvidia-ctk`). The image ships its own CUDA libraries — only the driver has to be present on the host.
-
-### GPU (default)
-
 ```bash
-cp .env.example .env      # optional: set VC_PORT / HOST_AUDIO / ANTHROPIC_API_KEY
+cp .env.example .env
 docker compose up --build
 # open http://localhost:7862
 ```
 
-Model downloads (Hugging Face, torch.hub, SpeechBrain, Argos Translate) are kept in named volumes, so they persist across `docker compose down`.
+CPU-only: `docker compose --profile cpu up --build app-cpu`
 
-### CPU only
+Model caches persist in Docker volumes. Runtime artifacts (`processed/`, `checkpoints/`, `logs/`) are gitignored.
 
-```bash
-docker compose --profile cpu up --build app-cpu
-```
+## TTS quality tips (Polish)
 
-### Custom input directory
+- Use **F5-TTS** with the Polish community checkpoint (`polish` shorthand) and a clean 10–30 s reference
+- Provide or auto-generate a **reference transcript** for F5-TTS
+- Keep **Strict timing sync** off unless dubbing to fixed SRT slots; use gentle sync for subtitle alignment without speech compression
+- Enable **reference preprocessing** (VAD / denoise / best window)
+- Output is **24 kHz** for clone-TTS backends (Chatterbox, F5-TTS, XTTS)
 
-By default `./data` on the host is mounted as `/data` in the container (read-write, so `ref_preprocess` can write its sidecar cache). Point the Gradio "input audio" / "reference" pickers there, or override via `HOST_AUDIO` in `.env`:
+## Tips for voice conversion
 
-```bash
-HOST_AUDIO=/media/wilk/PV1/pv/AUDIO docker compose up
-```
-
-### Useful overrides
-
-```bash
-# disable --low-vram:
-docker compose run --rm app python app.py --host 0.0.0.0 --port 7862
-
-# public Gradio tunnel:
-docker compose run --rm -p 7862:7862 app python app.py --host 0.0.0.0 --port 7862 --share
-```
-
-## How it works
-
-1. HuBERT extracts frame-level speech features from the **input** audio
-2. WavLM extracts features from the **reference** audio, building a matching set
-3. For each input frame, the k nearest neighbors from the reference set are found
-4. HiFiGAN vocoder reconstructs the audio using the matched reference features
-
-Result: the linguistic content of the input, but in the voice of the reference speaker.
-
-## Tips for best results
-
-- Reference sample: clean speech, no background music/noise
-- Reference duration: 15-30 seconds works best
-- Supported formats: WAV, MP3, FLAC, OGG
-- Both audios are automatically resampled to 16 kHz
+- Reference: clean single-speaker speech, 15–30 s, no music
+- Chatterbox VC or Seed-VC with preprocessing + best-of-N=3 for best clone quality
+- Optional OpenVoice post-step to unify timbre across long files

@@ -26,6 +26,12 @@ dist/
 # Local input/output data (Docker bind-mount default lives here)
 /data/
 
+# Runtime caches (OpenVoice segments, HF model caches, logs)
+/processed/
+/checkpoints/
+/logs/
+output.srt
+
 # Model caches sometimes dropped next to the repo
 *.pt
 *.pth
