@@ -7,10 +7,10 @@ Free tools (all local except edge-tts):
 - argostranslate : English → target language (local, own package system)
 - edge-tts       : Neural TTS (free, Microsoft Edge voices, online)
 
-Sync mode (DTW): for each Whisper segment, TTS audio is non-uniformly warped to
-match the energy-peak positions of the source — not just its total length.
-DTW (Dynamic Time Warping) aligns RMS energy envelopes so that speech peaks in the
-translated audio land at the same moments as speech peaks in the original.
+Sync modes for segment timing:
+- off    : natural speech speed, crossfade placement (default, best quality)
+- gentle : scale silences only; never time-stretch speech
+- strict : fit to SRT slots including time-stretch (may compress speech)
 """
 
 import asyncio
@@ -30,7 +30,16 @@ from faster_whisper import WhisperModel
 import argostranslate.package
 import argostranslate.translate
 
-SAMPLE_RATE = 16000
+from audio_utils import (
+    crossfade_samples,
+    mix_at,
+    normalize_lufs,
+    output_sr_for_backend,
+    resample,
+)
+from text_normalize_pl import normalize_for_tts
+
+SAMPLE_RATE = 16000  # legacy / Edge-TTS timeline base
 VAD_TOP_DB = 30  # silence threshold (dB below peak) for speech/silence split
 # Max time-compression when TTS is longer than the Whisper segment (higher = fewer hard cuts)
 MAX_SYNC_SPEEDUP = 2.0
@@ -376,6 +385,227 @@ def _fit_by_silence(tts_wav: np.ndarray, target_samples: int) -> np.ndarray:
     if len(result) < target_samples:
         result = np.pad(result, (0, target_samples - len(result)))
     return result[:target_samples]
+
+
+def _coerce_sync_mode(sync: bool | str) -> str:
+    """Map UI value to sync mode: off | gentle | strict."""
+    if isinstance(sync, str):
+        mode = sync.lower().strip()
+        if mode in ("off", "gentle", "strict"):
+            return mode
+        if mode in ("false", "0", "none", ""):
+            return "off"
+        return "strict"
+    return "strict" if sync else "off"
+
+
+def _fit_by_silence_gentle(tts_wav: np.ndarray, target_samples: int) -> tuple[np.ndarray, bool]:
+    """
+    Fit TTS by scaling silences only. Never time-stretches speech.
+    Returns (audio, overflow) where overflow=True if speech exceeds the slot.
+    """
+    if len(tts_wav) == 0:
+        return np.zeros(target_samples, dtype=np.float32), False
+
+    intervals = librosa.effects.split(tts_wav, top_db=VAD_TOP_DB)
+    if len(intervals) == 0:
+        return np.zeros(target_samples, dtype=np.float32), False
+
+    speech_total = sum(int(e - s) for s, e in intervals)
+    if speech_total >= target_samples:
+        speech_only = _concat_speech(tts_wav, intervals)
+        overflow = len(speech_only) > target_samples
+        if overflow:
+            return _truncate_at_speech_boundary(speech_only, target_samples), True
+        return np.pad(speech_only, (0, target_samples - len(speech_only))), False
+
+    # Reuse silence scaling from _fit_by_silence (speech fits)
+    return _fit_by_silence(tts_wav, target_samples), False
+
+
+def _merge_segments_for_tts(
+    parsed: list[tuple[str, str, str]],
+    max_gap_s: float = 0.4,
+    max_chars: int = 400,
+) -> list[dict]:
+    """Merge adjacent SRT segments for single TTS calls (better prosody)."""
+    groups: list[dict] = []
+    current: dict | None = None
+
+    for start_s, end_s, text in parsed:
+        text = text.strip()
+        if not text:
+            continue
+        start_f, end_f = float(start_s), float(end_s)
+        if current is None:
+            current = {
+                "start": start_f,
+                "end": end_f,
+                "texts": [text],
+            }
+            continue
+        gap = start_f - current["end"]
+        combined_len = len(" ".join(current["texts"])) + 1 + len(text)
+        if gap <= max_gap_s and combined_len <= max_chars:
+            current["end"] = end_f
+            current["texts"].append(text)
+        else:
+            groups.append(current)
+            current = {"start": start_f, "end": end_f, "texts": [text]}
+    if current is not None:
+        groups.append(current)
+
+    for g in groups:
+        g["text"] = " ".join(g["texts"])
+    return groups
+
+
+def _synthesize_tts_file(
+    text: str,
+    *,
+    backend: str,
+    lang_code: str,
+    voice: str,
+    ref_path: str | None,
+    tts_path: str,
+    tts_rate: str,
+    tts_pitch: str,
+    xtts_speed: float,
+    chatterbox_exaggeration: float,
+    chatterbox_cfg_weight: float,
+    f5tts_ref_text: str,
+    f5tts_model_path: str | None,
+    f5tts_speed: float,
+    seed: int = -1,
+) -> None:
+    text = normalize_for_tts(text, lang_code)
+    if backend == "xtts":
+        import xtts_engine
+        xtts_engine.synthesize(
+            text=text,
+            language=lang_code,
+            ref_audio_path=ref_path,
+            output_path=tts_path,
+            speed=xtts_speed,
+        )
+    elif backend == "chatterbox":
+        import chatterbox_engine
+        chatterbox_engine.synthesize(
+            text=text,
+            language=lang_code,
+            ref_audio_path=ref_path,
+            output_path=tts_path,
+            exaggeration=chatterbox_exaggeration,
+            cfg_weight=chatterbox_cfg_weight,
+        )
+    elif backend == "f5tts":
+        import f5tts_engine
+        model_path = f5tts_model_path
+        if model_path is None and lang_code == "pl":
+            model_path = "polish"
+        f5tts_engine.synthesize(
+            text=text,
+            ref_audio_path=ref_path,
+            output_path=tts_path,
+            ref_text=f5tts_ref_text,
+            model_path=model_path,
+            speed=f5tts_speed,
+            seed=seed,
+        )
+    else:
+        Path(tts_path).unlink(missing_ok=True)
+        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
+            mp3_path = f.name
+        _tts_run(text, voice, mp3_path, rate=tts_rate, pitch=tts_pitch)
+        wav, sr = librosa.load(mp3_path, sr=None, mono=True)
+        Path(mp3_path).unlink(missing_ok=True)
+        sf.write(tts_path, resample(wav, int(sr), output_sr_for_backend("edge")), output_sr_for_backend("edge"))
+
+
+def _build_timeline_audio(
+    groups: list[dict],
+    *,
+    total_duration: float,
+    output_sr: int,
+    sync_mode: str,
+    backend: str,
+    lang_code: str,
+    voice: str,
+    ref_path: str | None,
+    tts_rate: str,
+    tts_pitch: str,
+    xtts_speed: float,
+    chatterbox_exaggeration: float,
+    chatterbox_cfg_weight: float,
+    f5tts_ref_text: str,
+    f5tts_model_path: str | None,
+    f5tts_speed: float,
+    seed: int,
+    progress_cb=None,
+) -> tuple[np.ndarray, list[str]]:
+    """Synthesize merged segment groups and assemble timeline with crossfade."""
+    warnings: list[str] = []
+    total_samples = max(int(total_duration * output_sr), 1)
+    out = np.zeros(total_samples, dtype=np.float32)
+    fade_n = crossfade_samples(output_sr, 45.0)
+    n = len(groups)
+
+    for i, group in enumerate(groups):
+        text = group["text"]
+        start_f, end_f = group["start"], group["end"]
+        label = f"{i + 1}/{n}"
+        if progress_cb:
+            progress_cb(f"TTS group {label}: {text[:70]}")
+
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+            tts_path = f.name
+        try:
+            _synthesize_tts_file(
+                text,
+                backend=backend,
+                lang_code=lang_code,
+                voice=voice,
+                ref_path=ref_path,
+                tts_path=tts_path,
+                tts_rate=tts_rate,
+                tts_pitch=tts_pitch,
+                xtts_speed=xtts_speed,
+                chatterbox_exaggeration=chatterbox_exaggeration,
+                chatterbox_cfg_weight=chatterbox_cfg_weight,
+                f5tts_ref_text=f5tts_ref_text,
+                f5tts_model_path=f5tts_model_path,
+                f5tts_speed=f5tts_speed,
+                seed=seed,
+            )
+            tts_wav, file_sr = librosa.load(tts_path, sr=None, mono=True)
+            tts_wav = resample(tts_wav, int(file_sr), output_sr)
+        finally:
+            Path(tts_path).unlink(missing_ok=True)
+
+        if len(tts_wav) == 0:
+            continue
+
+        seg_start = int(start_f * output_sr)
+        seg_end = min(int(end_f * output_sr), total_samples)
+        target_samples = max(seg_end - seg_start, 1)
+
+        if sync_mode == "strict":
+            tts_warped = _fit_by_silence(tts_wav, target_samples)
+            out = mix_at(out, seg_start, tts_warped[:target_samples], fade_n)
+        elif sync_mode == "gentle":
+            tts_warped, overflow = _fit_by_silence_gentle(tts_wav, target_samples)
+            if overflow:
+                warnings.append(
+                    f"Segment group {label}: mowa dłuższa niż slot SRT — skrócono bez przyspieszania."
+                )
+            out = mix_at(out, seg_start, tts_warped, fade_n)
+        else:
+            needed = seg_start + len(tts_wav)
+            if needed > len(out):
+                out = np.pad(out, (0, needed - len(out)))
+            out = mix_at(out, seg_start, tts_wav, fade_n)
+
+    return out, warnings
 
 
 # ── Main building block ───────────────────────────────────────────────────────
@@ -748,29 +978,27 @@ def synthesize_from_edited(
     knn_vc=None,
     matching_set=None,
     topk: int = 4,
-    sync: bool = True,
+    sync: bool | str = "off",
     tts_rate: str = "+0%",
     tts_pitch: str = "+0Hz",
     tts_backend: str = "edge",   # "edge" | "xtts" | "chatterbox" | "f5tts"
     xtts_ref_path: str | None = None,
     xtts_speed: float = 1.0,
-    chatterbox_exaggeration: float = 0.5,
-    chatterbox_cfg_weight: float = 0.5,
+    chatterbox_exaggeration: float = 0.35,
+    chatterbox_cfg_weight: float = 0.7,
     f5tts_ref_text: str = "",
     f5tts_model_path: str | None = None,
     f5tts_speed: float = 1.0,
+    best_of_n: int = 1,
     progress_cb=None,
-) -> None:
+) -> int:
     """
     Step 2 of the two-step interactive pipeline.
 
     Parses the user-edited segment text (format: "[start - end] text per line"),
-    synthesizes TTS for each segment, fits it to the original timing.
+    merges adjacent segments for natural prosody, synthesizes TTS, assembles timeline.
 
-    tts_backend="edge"        : edge-tts + optional kNN-VC
-    tts_backend="xtts"        : XTTS v2 zero-shot voice cloning (~1.8 GB, Polish native)
-    tts_backend="chatterbox"  : Chatterbox Multilingual — beats ElevenLabs, MIT license
-    tts_backend="f5tts"       : F5-TTS flow-matching — best naturalness, fine-tunable
+    Returns output sample rate written to ``output_path``.
     """
     def step(msg: str):
         print(msg)
@@ -783,9 +1011,11 @@ def synthesize_from_edited(
 
     lang_code = LANGUAGES[target_language]["lang_code"]
     voice = LANGUAGES[target_language]["tts_voice"]
-
+    sync_mode = _coerce_sync_mode(sync)
     backend = (tts_backend or "edge").lower().strip()
-    ref_path = xtts_ref_path  # shared reference audio for all cloning backends
+    ref_path = xtts_ref_path
+    output_sr = output_sr_for_backend(backend)
+    groups = _merge_segments_for_tts(parsed)
 
     # Cloning backends must not silently fall back to Edge-TTS (preset Microsoft voice).
     if backend == "xtts":
@@ -841,7 +1071,9 @@ def synthesize_from_edited(
             raise RuntimeError(
                 "F5-TTS wymaga pliku referencyjnego (5–15 s) + opcjonalnie transkrypt."
             )
-        step(f"Silnik: F5-TTS | referencja: {Path(ref_path).name}")
+        if not f5tts_model_path and lang_code == "pl":
+            f5tts_model_path = "polish"
+        step(f"Silnik: F5-TTS | referencja: {Path(ref_path).name} | sync={sync_mode}")
 
     elif backend != "edge":
         raise RuntimeError(f"Nieznany silnik TTS: {tts_backend!r}")
@@ -851,93 +1083,79 @@ def synthesize_from_edited(
             "Dla klonowania wybierz Chatterbox / XTTS / F5-TTS."
         )
 
-    total_samples = int(total_duration * SAMPLE_RATE)
-    out = np.zeros(total_samples, dtype=np.float32)
+    step(f"Segment groups: {len(groups)} (merged from {len(parsed)} lines) | output {output_sr} Hz")
 
-    n = len(parsed)
-    for i, (start_s, end_s, text) in enumerate(parsed):
-        text = text.strip()
-        if not text:
-            continue
+    n_candidates = max(1, int(best_of_n or 1))
+    best_audio: np.ndarray | None = None
+    best_score = -1.0
+    all_warnings: list[str] = []
 
-        start_f, end_f = float(start_s), float(end_s)
+    for cand in range(n_candidates):
+        seed = cand * 17 + 42 if n_candidates > 1 else -1
+        if n_candidates > 1:
+            step(f"Best-of-N candidate {cand + 1}/{n_candidates}")
+        audio, warnings = _build_timeline_audio(
+            groups,
+            total_duration=float(total_duration),
+            output_sr=output_sr,
+            sync_mode=sync_mode,
+            backend=backend,
+            lang_code=lang_code,
+            voice=voice,
+            ref_path=ref_path,
+            tts_rate=tts_rate,
+            tts_pitch=tts_pitch,
+            xtts_speed=xtts_speed,
+            chatterbox_exaggeration=chatterbox_exaggeration,
+            chatterbox_cfg_weight=chatterbox_cfg_weight,
+            f5tts_ref_text=f5tts_ref_text,
+            f5tts_model_path=f5tts_model_path,
+            f5tts_speed=f5tts_speed,
+            seed=seed,
+            progress_cb=progress_cb,
+        )
+        all_warnings.extend(warnings)
 
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
-            tts_path = f.name
+        if n_candidates > 1 and ref_path and backend != "edge":
+            try:
+                import speaker_sim
+                if speaker_sim.is_available():
+                    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+                        cand_path = tmp.name
+                    sf.write(cand_path, audio, output_sr)
+                    score = speaker_sim.similarity(ref_path, cand_path)
+                    Path(cand_path).unlink(missing_ok=True)
+                    step(f"Candidate {cand + 1} speaker similarity: {score:.3f}")
+                    if score > best_score:
+                        best_score = score
+                        best_audio = audio
+                    continue
+            except Exception as e:
+                step(f"Best-of-N scoring skipped ({e})")
+        best_audio = audio
+        break
 
-        if backend == "xtts":
-            step(f"XTTS {i+1}/{n}: {text[:70]}")
-            import xtts_engine
-            xtts_engine.synthesize(
-                text=text,
-                language=lang_code,
-                ref_audio_path=ref_path,
-                output_path=tts_path,
-                speed=xtts_speed,
-            )
+    if best_audio is None:
+        raise RuntimeError("TTS produced no audio.")
 
-        elif backend == "chatterbox":
-            step(f"Chatterbox {i+1}/{n}: {text[:70]}")
-            import chatterbox_engine
-            chatterbox_engine.synthesize(
-                text=text,
-                language=lang_code,
-                ref_audio_path=ref_path,
-                output_path=tts_path,
-                exaggeration=chatterbox_exaggeration,
-                cfg_weight=chatterbox_cfg_weight,
-            )
+    best_audio = normalize_lufs(best_audio, output_sr)
 
-        elif backend == "f5tts":
-            step(f"F5-TTS {i+1}/{n}: {text[:70]}")
-            import f5tts_engine
-            f5tts_engine.synthesize(
-                text=text,
-                ref_audio_path=ref_path,
-                output_path=tts_path,
-                ref_text=f5tts_ref_text,
-                model_path=f5tts_model_path if f5tts_model_path else None,
-                speed=f5tts_speed,
-            )
-
-        else:  # edge-tts
-            step(f"Edge-TTS {i+1}/{n}: {text[:70]}")
-            Path(tts_path).unlink(missing_ok=True)
-            with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
-                tts_path = f.name
-            _tts_run(text, voice, tts_path, rate=tts_rate, pitch=tts_pitch)
-
-        tts_wav, _ = librosa.load(tts_path, sr=SAMPLE_RATE, mono=True)
-        Path(tts_path).unlink(missing_ok=True)
-
-        if len(tts_wav) == 0:
-            continue
-
-        seg_start = int(start_f * SAMPLE_RATE)
-        seg_end = min(int(end_f * SAMPLE_RATE), total_samples)
-        target_samples = seg_end - seg_start
-
-        if sync:
-            tts_warped = _fit_by_silence(tts_wav, target_samples)
-            slot_end = seg_start + target_samples
-            if slot_end > len(out):
-                out = np.pad(out, (0, slot_end - len(out)))
-            out[seg_start:slot_end] = tts_warped
-        else:
-            place_end = min(seg_start + len(tts_wav), total_samples)
-            if place_end > len(out):
-                out = np.pad(out, (0, place_end - len(out)))
-            out[seg_start:place_end] = tts_wav[: place_end - seg_start]
+    for w in dict.fromkeys(all_warnings):
+        step(f"⚠ {w}")
 
     # Voice conversion — only for edge-tts backend (others have built-in voice cloning)
     if backend == "edge" and knn_vc is not None and matching_set is not None:
         step("Applying voice conversion...")
+        edge_sr = OUTPUT_SR_EDGE
+        edge_audio = resample(best_audio, output_sr, edge_sr)
         from voice_utils import extract_features_chunked, match_chunked
-        tensor = torch.from_numpy(out).unsqueeze(0).to(next(knn_vc.parameters()).device)
+        tensor = torch.from_numpy(edge_audio).unsqueeze(0).to(next(knn_vc.parameters()).device)
         with torch.inference_mode():
             query_seq = extract_features_chunked(knn_vc, tensor, progress_cb=step)
             out_wav = match_chunked(knn_vc, query_seq, matching_set, topk=topk, progress_cb=step)
         torch.cuda.empty_cache()
-        sf.write(output_path, out_wav.squeeze().cpu().numpy(), SAMPLE_RATE)
-    else:
-        sf.write(output_path, out, SAMPLE_RATE)
+        sf.write(output_path, out_wav.squeeze().cpu().numpy(), edge_sr)
+        return edge_sr
+
+    sf.write(output_path, best_audio, output_sr)
+    return output_sr

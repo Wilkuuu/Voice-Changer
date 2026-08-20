@@ -54,6 +54,35 @@ _model = None
 _RUNTIME = {"openvoice_chunk_sec": float(_OV_DEFAULT_CHUNK_SEC)}
 
 
+def _default_tts_backend(has_f5: bool, has_cb: bool) -> str:
+    if has_f5:
+        return "F5-TTS"
+    if has_cb:
+        return "Chatterbox"
+    return "Edge-TTS + OpenVoice"
+
+
+def _apply_openvoice_post_mix(
+    wav_path: str,
+    ref_path: str,
+    output_path: str,
+    tau: float = 0.4,
+    progress_cb=None,
+) -> None:
+    """Light OpenVoice pass on full TTS mix for timbre consistency."""
+    if not openvoice_available() or openvoice_convert is None:
+        raise RuntimeError("OpenVoice post-step requested but openvoice-cli is not installed.")
+    openvoice_convert(
+        input_path=wav_path,
+        ref_path=ref_path,
+        output_path=output_path,
+        chunk_duration_sec=_RUNTIME["openvoice_chunk_sec"],
+        tau=tau,
+        temperature=1.0,
+        progress_cb=lambda msg, _p=None: progress_cb(msg) if progress_cb else None,
+    )
+
+
 def _has_bark() -> bool:
     try:
         import bark  # noqa: F401
@@ -613,12 +642,14 @@ def run_step1_transcribe(
 
 def run_step2_synthesize(
     edited_text, total_duration, reference_audio, target_language,
-    topk, sync, tts_rate_pct, tts_pitch_hz,
+    topk, sync_mode, tts_rate_pct, tts_pitch_hz,
     tts_backend, xtts_speed,
     chatterbox_exaggeration, chatterbox_cfg_weight,
     f5tts_ref_text, f5tts_model_path, f5tts_speed,
     input_audio_path,
     preprocess_reference: bool = True,
+    best_of_n: int = 1,
+    apply_openvoice_post: bool = False,
     progress=gr.Progress(),
 ):
     """Tab 2 Step 2: TTS + optional voice conversion from edited segments."""
@@ -667,58 +698,58 @@ def run_step2_synthesize(
 
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
         out_path = tmp.name
+    post_path = out_path
 
     try:
+        output_sr = SAMPLE_RATE
+        synth_kwargs = dict(
+            edited_text=edited_text,
+            total_duration=float(total_duration),
+            target_language=target_language,
+            sync=sync_mode or "off",
+            xtts_ref_path=ref_path,
+            chatterbox_exaggeration=float(chatterbox_exaggeration),
+            chatterbox_cfg_weight=float(chatterbox_cfg_weight),
+            f5tts_ref_text=f5tts_ref_text or "",
+            f5tts_speed=float(f5tts_speed),
+            best_of_n=max(1, int(best_of_n or 1)),
+            progress_cb=log,
+        )
+
         if tts_backend == "XTTS v2":
             progress(0.05, desc="Loading XTTS v2 model (first run: downloads ~1.8 GB)...")
-            tr.synthesize_from_edited(
-                edited_text=edited_text,
-                total_duration=float(total_duration),
-                target_language=target_language,
+            output_sr = tr.synthesize_from_edited(
                 output_path=out_path,
-                sync=bool(sync),
                 tts_backend="xtts",
-                xtts_ref_path=ref_path,
                 xtts_speed=float(xtts_speed),
-                progress_cb=log,
+                **synth_kwargs,
             )
 
         elif tts_backend == "Chatterbox":
             progress(0.05, desc="Loading Chatterbox Multilingual (wymaga referencji + VRAM)...")
-            tr.synthesize_from_edited(
-                edited_text=edited_text,
-                total_duration=float(total_duration),
-                target_language=target_language,
+            output_sr = tr.synthesize_from_edited(
                 output_path=out_path,
-                sync=bool(sync),
                 tts_backend="chatterbox",
-                xtts_ref_path=ref_path,
-                chatterbox_exaggeration=float(chatterbox_exaggeration),
-                chatterbox_cfg_weight=float(chatterbox_cfg_weight),
-                progress_cb=log,
+                **synth_kwargs,
             )
 
         elif tts_backend == "F5-TTS":
             model_path = f5tts_model_path.strip() if f5tts_model_path else None
             if model_path == "":
                 model_path = None
+            if model_path is None:
+                lang_meta = tr.LANGUAGES.get(target_language, {})
+                if lang_meta.get("lang_code") == "pl":
+                    model_path = "polish"
             progress(0.05, desc="Loading F5-TTS model...")
-            tr.synthesize_from_edited(
-                edited_text=edited_text,
-                total_duration=float(total_duration),
-                target_language=target_language,
+            output_sr = tr.synthesize_from_edited(
                 output_path=out_path,
-                sync=bool(sync),
                 tts_backend="f5tts",
-                xtts_ref_path=ref_path,
-                f5tts_ref_text=f5tts_ref_text or "",
                 f5tts_model_path=model_path,
-                f5tts_speed=float(f5tts_speed),
-                progress_cb=log,
+                **synth_kwargs,
             )
 
         else:
-            # Edge-TTS (with optional OpenVoice)
             rate_str = f"{int(tts_rate_pct):+d}%"
             pitch_str = f"{int(tts_pitch_hz):+d}Hz"
 
@@ -733,16 +764,12 @@ def run_step2_synthesize(
                 import tempfile as _tf
                 with _tf.NamedTemporaryFile(suffix=".wav", delete=False) as _tmp:
                     tts_only_path = _tmp.name
-                tr.synthesize_from_edited(
-                    edited_text=edited_text,
-                    total_duration=float(total_duration),
-                    target_language=target_language,
+                output_sr = tr.synthesize_from_edited(
                     output_path=tts_only_path,
-                    sync=bool(sync),
                     tts_rate=rate_str,
                     tts_pitch=pitch_str,
                     tts_backend="edge",
-                    progress_cb=log,
+                    **synth_kwargs,
                 )
                 progress(0.85, desc="Applying OpenVoice tone-color transfer...")
                 openvoice_convert(
@@ -754,19 +781,28 @@ def run_step2_synthesize(
                 )
                 Path(tts_only_path).unlink(missing_ok=True)
             else:
-                tr.synthesize_from_edited(
-                    edited_text=edited_text,
-                    total_duration=float(total_duration),
-                    target_language=target_language,
+                output_sr = tr.synthesize_from_edited(
                     output_path=out_path,
-                    sync=bool(sync),
                     tts_rate=rate_str,
                     tts_pitch=pitch_str,
                     tts_backend="edge",
-                    progress_cb=log,
+                    **synth_kwargs,
                 )
 
-        out_wav, _ = librosa.load(out_path, sr=SAMPLE_RATE, mono=True)
+        if (
+            apply_openvoice_post
+            and ref_path
+            and tts_backend in ("Chatterbox", "F5-TTS", "XTTS v2")
+            and openvoice_available()
+        ):
+            progress(0.9, desc="OpenVoice post-pass (timbre unify)...")
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as post_tmp:
+                post_path = post_tmp.name
+            _apply_openvoice_post_mix(out_path, ref_path, post_path, tau=0.4, progress_cb=log)
+            Path(out_path).unlink(missing_ok=True)
+            out_path = post_path
+
+        out_wav, _ = librosa.load(out_path, sr=output_sr, mono=True)
     except RuntimeError as e:
         raise gr.Error(str(e)) from e
     finally:
@@ -777,7 +813,7 @@ def run_step2_synthesize(
         "W logach terminala szukaj linii `Silnik: Chatterbox` lub `Chatterbox 1/N` — "
         "jeśli widzisz `Edge-TTS`, klonowanie nie działało."
     )
-    return (SAMPLE_RATE, out_wav), "\n\n".join(status_lines)
+    return (output_sr, out_wav), "\n\n".join(status_lines)
 
 
 def build_ui():
@@ -817,8 +853,8 @@ def build_ui():
                         )
                         with gr.Row():
                             speech_engine = gr.Dropdown(
-                                choices=["Chatterbox", "XTTS v2", "F5-TTS", "Edge-TTS"],
-                                value="Edge-TTS",
+                                choices=["F5-TTS", "Chatterbox", "XTTS v2", "Edge-TTS"],
+                                value=("F5-TTS" if has_f5 else ("Chatterbox" if has_cb_tts else "Edge-TTS")),
                                 label="Speech engine",
                             )
                             use_bark_tags = gr.Checkbox(
@@ -868,19 +904,19 @@ def build_ui():
                         progress(0.2, desc="Bark not installed → rendering without non-speech Bark tags")
                         bark_on = False
                     try:
-                        wav = tagged_tts.render_tagged_script(
+                        wav, out_sr = tagged_tts.render_tagged_script(
                             script,
                             speech_engine=speech,
                             language=lang,
                             ref_audio_path=ref_path,
                             use_bark_for_tags=bool(bark_on),
                             bark_preset=bark_hp or "v2/pl_speaker_0",
+                            f5tts_model_path="polish" if speech == "f5tts" else None,
                         )
                     except RuntimeError as e:
-                        # Friendly guidance instead of a red "Error" box
                         raise gr.Error(str(e)) from e
                     progress(1.0, desc="Done.")
-                    return (SAMPLE_RATE, wav)
+                    return (out_sr, wav)
 
                 tag_transcribe_btn.click(
                     fn=_transcribe_ref,
@@ -1180,11 +1216,11 @@ def build_ui():
                         gr.Markdown("### Step 2 — Synthesize & Convert")
                         tr_tts_backend = gr.Radio(
                             choices=["Edge-TTS + OpenVoice", "XTTS v2", "Chatterbox", "F5-TTS"],
-                            value=("Chatterbox" if has_cb_tts else "Edge-TTS + OpenVoice"),
+                            value=_default_tts_backend(has_f5, has_cb_tts),
                             label="TTS Engine",
                             info=(
-                                "Chatterbox: najlepsza jakość, natywny polski, MIT. "
-                                "F5-TTS: flow-matching, fine-tunable, wspólnotowy model PL. "
+                                "F5-TTS: najlepsza naturalność PL (checkpoint polish). "
+                                "Chatterbox: zero-shot, natywny polski. "
                                 "XTTS v2: zero-shot klonowanie głosu. "
                                 "Edge-TTS + OpenVoice: lekka opcja online."
                             ),
@@ -1197,10 +1233,25 @@ def build_ui():
                             value=True,
                             label="Przygotuj referencję przed syntezą (VAD / denoise / najlepsze okno)",
                         )
-                        tr_sync = gr.Checkbox(
+                        tr_sync = gr.Radio(
+                            choices=["off", "gentle", "strict"],
+                            value="off",
+                            label="Timing sync mode",
+                            info=(
+                                "off = naturalna mowa (zalecane). "
+                                "gentle = dopasuj pauzy bez przyspieszania. "
+                                "strict = wymuś sloty SRT (może ścinać/przyspieszać)."
+                            ),
+                        )
+                        tr_best_of_n = gr.Slider(
+                            minimum=1, maximum=5, value=1, step=1,
+                            label="Best-of-N (TTS)",
+                            info="Generuj N wariantów i wybierz najwyższe podobieństwo do referencji (wolniejsze).",
+                        )
+                        tr_openvoice_post = gr.Checkbox(
                             value=False,
-                            label="Synchronize with source timing",
-                            info="Włącz tylko do dopasowania do wideo. Wyłączone = pełne słowa (wolniejsze/szybsze niż oryginał).",
+                            label="OpenVoice post-pass (unify timbre across segments)",
+                            info="Lekki pass OpenVoice na całym mixie — wymaga openvoice-cli.",
                         )
                         with gr.Group(visible=True) as tr_group_chatterbox:
                             gr.Markdown(
@@ -1208,9 +1259,9 @@ def build_ui():
                                 "Ucięte słowa? Wyłącz sync lub skróć tekst w segmencie."
                             )
                             tr_cb_exaggeration = gr.Slider(
-                                minimum=0.0, maximum=1.0, value=0.5, step=0.05,
+                                minimum=0.0, maximum=1.0, value=0.35, step=0.05,
                                 label="Emotion exaggeration",
-                                info="Higher = more expressive/dramatic speech.",
+                                info="Lower = more natural narration (0.3–0.4 for Polish).",
                             )
                             tr_cb_cfg = gr.Slider(
                                 minimum=0.0, maximum=1.0, value=0.7, step=0.05,
@@ -1227,8 +1278,9 @@ def build_ui():
                             )
                             tr_f5_model_path = gr.Textbox(
                                 label="F5-TTS model path (optional)",
+                                value="polish",
                                 placeholder='Puste = model bazowy. Wpisz "polish" dla modelu PL lub ścieżkę do .pt',
-                                info='Use "polish" to auto-download the Polish community checkpoint (~3 GB).',
+                                info='Domyślnie "polish" — community checkpoint PL (~3 GB).',
                             )
                             tr_f5_speed = gr.Slider(
                                 minimum=0.5, maximum=2.0, value=1.0, step=0.05,
@@ -1306,6 +1358,8 @@ def build_ui():
                         tr_f5_ref_text, tr_f5_model_path, tr_f5_speed,
                         tr_input_state,
                         tr_ref_preprocess,
+                        tr_best_of_n,
+                        tr_openvoice_post,
                     ],
                     outputs=[tr_output, tr_step2_status],
                 )

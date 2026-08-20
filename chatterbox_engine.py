@@ -20,8 +20,9 @@ import re
 from device_utils import empty_cache as _empty_cache, select_device as _select_device
 
 # Chatterbox degrades / cuts off on long single-shot text (~200–350 chars). Chunk by sentence.
-MAX_CHARS_PER_GENERATE = 220
-PAUSE_BETWEEN_CHUNKS_S = 0.08
+MAX_CHARS_PER_GENERATE = 280
+PAUSE_BETWEEN_CHUNKS_S = 0.05
+CHUNK_CROSSFADE_MS = 200
 
 _model = None
 _device: str | None = None
@@ -225,8 +226,8 @@ def synthesize(
         kwargs["language_id"] = lang
 
     parts: list[np.ndarray] = []
-    pause_n = max(0, int(PAUSE_BETWEEN_CHUNKS_S * model.sr))
-    pause = np.zeros(pause_n, dtype=np.float32) if pause_n else None
+    sr = int(model.sr)
+    fade_n = max(0, int(sr * CHUNK_CROSSFADE_MS / 1000.0))
 
     for i, chunk in enumerate(chunks):
         chunk = _ensure_min_tts_length(chunk)
@@ -247,13 +248,15 @@ def synthesize(
             print(f"[Chatterbox] Warning: empty audio for chunk {i + 1}, skipping", flush=True)
             continue
         parts.append(arr)
-        if pause is not None and i < len(chunks) - 1:
-            parts.append(pause)
 
     if not parts:
         raise RuntimeError("Chatterbox produced no audio (all chunks empty or failed).")
 
-    out = np.concatenate(parts).astype(np.float32, copy=False)
+    if len(parts) == 1:
+        out = parts[0]
+    else:
+        from audio_utils import concat_with_crossfade
+        out = concat_with_crossfade(parts, sr, pause_s=PAUSE_BETWEEN_CHUNKS_S, fade_ms=CHUNK_CROSSFADE_MS)
     peak = float(np.abs(out).max())
     if peak > 1e-6:
         out = out / peak * 0.95

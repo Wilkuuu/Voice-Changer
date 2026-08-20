@@ -21,8 +21,12 @@ Note: F5-TTS requires a text transcript of the reference audio for best results.
 
 from __future__ import annotations
 
+import hashlib
+from pathlib import Path
+
 _tts = None
 _loaded_model_path: str | None = None
+_ref_text_cache: dict[str, str] = {}
 
 
 def is_available() -> bool:
@@ -65,6 +69,52 @@ def get_tts(model_path: str | None = None):
     return _tts
 
 
+def _ref_text_cache_path(ref_audio_path: str) -> Path:
+    p = Path(ref_audio_path)
+    st = p.stat()
+    key = hashlib.sha1(f"{p.resolve()}:{st.st_mtime}:{st.st_size}".encode()).hexdigest()[:16]
+    return p.with_suffix(f".reftext{key}.txt")
+
+
+def get_or_transcribe_ref_text(ref_audio_path: str, ref_text: str = "") -> str:
+    """
+    Return reference transcript for F5-TTS. Uses explicit ``ref_text``, disk cache,
+    or Whisper auto-transcription on the reference file.
+    """
+    explicit = (ref_text or "").strip()
+    if explicit:
+        return explicit
+
+    cache_key = str(Path(ref_audio_path).resolve())
+    if cache_key in _ref_text_cache:
+        return _ref_text_cache[cache_key]
+
+    cache_path = _ref_text_cache_path(ref_audio_path)
+    if cache_path.exists():
+        text = cache_path.read_text(encoding="utf-8").strip()
+        if text:
+            _ref_text_cache[cache_key] = text
+            return text
+
+    try:
+        from translate import get_whisper
+        model = get_whisper(model_size="base")
+        segments, _info = model.transcribe(ref_audio_path, beam_size=3, vad_filter=True)
+        text = " ".join(seg.text.strip() for seg in segments if seg.text.strip())
+    except Exception as e:
+        print(f"[F5-TTS] Auto ref_text transcription failed ({e}); using empty ref_text.", flush=True)
+        text = ""
+
+    if text:
+        try:
+            cache_path.write_text(text, encoding="utf-8")
+        except Exception:
+            pass
+        _ref_text_cache[cache_key] = text
+        print(f"[F5-TTS] Auto ref_text ({len(text)} chars): {text[:80]}...", flush=True)
+    return text
+
+
 def synthesize(
     text: str,
     ref_audio_path: str,
@@ -90,10 +140,11 @@ def synthesize(
     """
     import soundfile as sf
 
+    resolved_ref_text = get_or_transcribe_ref_text(ref_audio_path, ref_text)
     tts = get_tts(model_path)
     wav, sr, _ = tts.infer(
         ref_file=ref_audio_path,
-        ref_text=ref_text,
+        ref_text=resolved_ref_text,
         gen_text=text,
         speed=speed,
         seed=None if seed < 0 else seed,
